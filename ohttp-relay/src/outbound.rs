@@ -299,6 +299,12 @@ impl AsyncWrite for OutboundStream {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
     use super::*;
 
     #[test]
@@ -338,5 +344,53 @@ mod tests {
         let uri = Uri::from_static("/relative");
         let err = destination_uri_to_gateway(&uri).expect_err("must fail");
         assert!(err.to_string().contains("must include scheme"));
+    }
+
+    #[tokio::test]
+    async fn socks5h_connect_uses_domain_target_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy listener");
+        let proxy_port = listener.local_addr().expect("proxy local addr").port();
+        let (tx, rx) = oneshot::channel::<(String, u16)>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept proxy connection");
+
+            let mut greeting = [0_u8; 3];
+            socket.read_exact(&mut greeting).await.expect("read socks greeting");
+            assert_eq!(greeting, [0x05, 0x01, 0x00], "expected unauthenticated SOCKS greeting");
+            socket.write_all(&[0x05, 0x00]).await.expect("write socks method selection");
+
+            let mut request_header = [0_u8; 4];
+            socket.read_exact(&mut request_header).await.expect("read socks request header");
+            assert_eq!(request_header[..3], [0x05, 0x01, 0x00], "expected CONNECT request");
+            assert_eq!(request_header[3], 0x03, "expected domain target type");
+
+            let mut host_len = [0_u8; 1];
+            socket.read_exact(&mut host_len).await.expect("read domain length");
+            let mut host = vec![0_u8; host_len[0] as usize];
+            socket.read_exact(&mut host).await.expect("read domain bytes");
+
+            let mut port_bytes = [0_u8; 2];
+            socket.read_exact(&mut port_bytes).await.expect("read target port");
+            let target_host = String::from_utf8(host).expect("valid utf8 host");
+            let target_port = u16::from_be_bytes(port_bytes);
+            tx.send((target_host, target_port)).expect("send target address to test");
+
+            socket
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("write socks success response");
+        });
+
+        let gateway = GatewayUri::from_static("http://example1234567890example1234567890.onion:80");
+        let proxy = OutboundProxy::parse(&format!("socks5h://127.0.0.1:{proxy_port}"))
+            .expect("valid outbound proxy");
+        let outbound = OutboundTransportConfig::new(Some(proxy), Some(Duration::from_secs(5)));
+
+        let _stream =
+            connect_gateway_stream(&gateway, &outbound).await.expect("socks5h connect should work");
+        let (target_host, target_port) = rx.await.expect("receive target address");
+        assert_eq!(target_host, gateway.host(), "socks proxy should receive domain target");
+        assert_eq!(target_port, gateway.port(), "socks proxy should receive gateway port");
     }
 }
