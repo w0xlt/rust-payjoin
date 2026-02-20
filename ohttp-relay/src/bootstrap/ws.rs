@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -16,9 +15,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{tungstenite, WebSocketStream};
 use tracing::{error, instrument};
 
-use crate::empty;
 use crate::error::Error;
 use crate::gateway_uri::GatewayUri;
+use crate::{empty, outbound, OutboundTransportConfig};
 
 /// Check if the request is a WebSocket upgrade request.
 ///
@@ -52,15 +51,12 @@ pub(crate) fn is_websocket_request<B>(req: &Request<B>) -> bool {
 pub(crate) async fn try_upgrade<B>(
     req: Request<B>,
     gateway_origin: GatewayUri,
+    outbound_transport: &OutboundTransportConfig,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Error>
 where
     B: Send + Debug + 'static,
 {
-    let gateway_addr = gateway_origin
-        .to_socket_addr()
-        .await
-        .map_err(|e| Error::InternalServerError(Box::new(e)))?
-        .ok_or_else(|| Error::NotFound)?;
+    let outbound_transport = outbound_transport.clone();
 
     let key = req
         .headers()
@@ -81,7 +77,8 @@ where
                     None,
                 )
                 .await;
-                if let Err(e) = serve_websocket(ws_stream, gateway_addr).await {
+                if let Err(e) = serve_websocket(ws_stream, gateway_origin, outbound_transport).await
+                {
                     error!("Error in websocket connection: {e}");
                 }
             }
@@ -104,12 +101,15 @@ where
 #[instrument(skip(ws_stream))]
 async fn serve_websocket<S>(
     ws_stream: WebSocketStream<S>,
-    gateway_addr: SocketAddr,
+    gateway_origin: GatewayUri,
+    outbound_transport: OutboundTransportConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut tcp_stream = tokio::net::TcpStream::connect(gateway_addr).await?;
+    let mut tcp_stream = outbound::connect_gateway_stream(&gateway_origin, &outbound_transport)
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
     let mut ws_io = WsIo::new(ws_stream);
     let (_, _) = tokio::io::copy_bidirectional(&mut ws_io, &mut tcp_stream).await?;
     Ok(())

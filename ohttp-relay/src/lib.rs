@@ -34,7 +34,9 @@ mod gateway_prober;
 #[cfg(feature = "_test-util")]
 pub mod gateway_prober;
 mod gateway_uri;
+mod outbound;
 pub mod sentinel;
+pub use outbound::{OutboundProxy, OutboundTransportConfig};
 pub use sentinel::SentinelTag;
 
 use crate::error::{BoxError, Error};
@@ -52,11 +54,24 @@ pub async fn listen_tcp(
     port: u16,
     gateway_origin: GatewayUri,
 ) -> Result<tokio::task::JoinHandle<Result<(), BoxError>>, BoxError> {
+    listen_tcp_with_outbound_config(port, gateway_origin, OutboundTransportConfig::default()).await
+}
+
+#[instrument]
+pub async fn listen_tcp_with_outbound_config(
+    port: u16,
+    gateway_origin: GatewayUri,
+    outbound_transport: OutboundTransportConfig,
+) -> Result<tokio::task::JoinHandle<Result<(), BoxError>>, BoxError> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     println!("OHTTP relay listening on tcp://{}", addr);
     let sentinel_tag = SentinelTag::new([0u8; 32]);
-    ohttp_relay(listener, RelayConfig::new_with_default_client(gateway_origin, sentinel_tag)).await
+    ohttp_relay(
+        listener,
+        RelayConfig::new_with_default_client(gateway_origin, sentinel_tag, outbound_transport),
+    )
+    .await
 }
 
 #[instrument]
@@ -64,10 +79,28 @@ pub async fn listen_socket(
     socket_path: &str,
     gateway_origin: GatewayUri,
 ) -> Result<tokio::task::JoinHandle<Result<(), BoxError>>, BoxError> {
+    listen_socket_with_outbound_config(
+        socket_path,
+        gateway_origin,
+        OutboundTransportConfig::default(),
+    )
+    .await
+}
+
+#[instrument]
+pub async fn listen_socket_with_outbound_config(
+    socket_path: &str,
+    gateway_origin: GatewayUri,
+    outbound_transport: OutboundTransportConfig,
+) -> Result<tokio::task::JoinHandle<Result<(), BoxError>>, BoxError> {
     let listener = UnixListener::bind(socket_path)?;
     info!("OHTTP relay listening on socket: {}", socket_path);
     let sentinel_tag = SentinelTag::new([0u8; 32]);
-    ohttp_relay(listener, RelayConfig::new_with_default_client(gateway_origin, sentinel_tag)).await
+    ohttp_relay(
+        listener,
+        RelayConfig::new_with_default_client(gateway_origin, sentinel_tag, outbound_transport),
+    )
+    .await
 }
 
 #[cfg(feature = "_test-util")]
@@ -79,7 +112,12 @@ pub async fn listen_tcp_on_free_port(
     let port = listener.local_addr()?.port();
     println!("OHTTP relay binding to port {}", listener.local_addr()?);
     let sentinel_tag = SentinelTag::new([0u8; 32]);
-    let config = RelayConfig::new(default_gateway, root_store, sentinel_tag);
+    let config = RelayConfig::new(
+        default_gateway,
+        root_store,
+        sentinel_tag,
+        OutboundTransportConfig::default(),
+    );
     let handle = ohttp_relay(listener, config).await?;
     Ok((port, handle))
 }
@@ -90,21 +128,27 @@ struct RelayConfig {
     client: HttpClient,
     prober: Prober,
     sentinel_tag: SentinelTag,
+    outbound_transport: OutboundTransportConfig,
 }
 
 impl RelayConfig {
-    fn new_with_default_client(default_gateway: GatewayUri, sentinel_tag: SentinelTag) -> Self {
-        Self::new(default_gateway, HttpClient::default(), sentinel_tag)
+    fn new_with_default_client(
+        default_gateway: GatewayUri,
+        sentinel_tag: SentinelTag,
+        outbound_transport: OutboundTransportConfig,
+    ) -> Self {
+        Self::new(default_gateway, HttpClient::default(), sentinel_tag, outbound_transport)
     }
 
     fn new(
         default_gateway: GatewayUri,
         into_client: impl Into<HttpClient>,
         sentinel_tag: SentinelTag,
+        outbound_transport: OutboundTransportConfig,
     ) -> Self {
         let client = into_client.into();
         let prober = Prober::new_with_client(client.clone());
-        RelayConfig { default_gateway, client, prober, sentinel_tag }
+        RelayConfig { default_gateway, client, prober, sentinel_tag, outbound_transport }
     }
 }
 
@@ -122,7 +166,11 @@ impl Service {
         // The new mechanism for specifying a custom gateway is via RFC 9540 using
         // `/.well-known/ohttp-gateway` request paths.
         let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
-        let config = RelayConfig::new_with_default_client(gateway_origin, sentinel_tag);
+        let config = RelayConfig::new_with_default_client(
+            gateway_origin,
+            sentinel_tag,
+            OutboundTransportConfig::default(),
+        );
         config.prober.assert_opt_in(&config.default_gateway).await;
         Self { config: Arc::new(config) }
     }
@@ -133,7 +181,12 @@ impl Service {
         sentinel_tag: SentinelTag,
     ) -> Self {
         let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
-        let config = RelayConfig::new(gateway_origin, root_store, sentinel_tag);
+        let config = RelayConfig::new(
+            gateway_origin,
+            root_store,
+            sentinel_tag,
+            OutboundTransportConfig::default(),
+        );
         config.prober.assert_opt_in(&config.default_gateway).await;
         Self { config: Arc::new(config) }
     }
@@ -250,7 +303,13 @@ where
         #[cfg(any(feature = "connect-bootstrap", feature = "ws-bootstrap"))]
         (&Method::GET, _) | (&Method::CONNECT, _) => {
             match parse_gateway_uri(&method, path, authority, config).await {
-                Ok(gateway_uri) => crate::bootstrap::handle_ohttp_keys(req, gateway_uri).await,
+                Ok(gateway_uri) =>
+                    crate::bootstrap::handle_ohttp_keys(
+                        req,
+                        gateway_uri,
+                        &config.outbound_transport,
+                    )
+                    .await,
                 Err(e) => Err(e),
             }
         }
