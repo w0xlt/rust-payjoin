@@ -77,6 +77,10 @@ rpchost = "http://localhost:18443/wallet/sender"
 [v2]
 pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
+# Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
+network_proxy = "socks5h://127.0.0.1:9050"
+# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
+bootstrap_mode = "auto"
 ```
 
 #### `receiver/config.toml`
@@ -92,6 +96,10 @@ rpchost = "http://localhost:18443/wallet/receiver"
 [v2]
 pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
+# Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
+network_proxy = "socks5h://127.0.0.1:9050"
+# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
+bootstrap_mode = "auto"
 ```
 
 Now, the receiver must generate an address to receive the payment. The format is:
