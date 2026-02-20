@@ -1,11 +1,16 @@
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use http::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
+use tower::Service;
 
 use crate::error::BoxError;
 use crate::GatewayUri;
@@ -126,6 +131,56 @@ pub(crate) async fn connect_gateway_stream(
             connect_tcp(addr, outbound.connect_timeout()).await.map(OutboundStream::Direct)
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TransportConnector {
+    outbound: OutboundTransportConfig,
+}
+
+impl TransportConnector {
+    pub(crate) fn new(outbound: OutboundTransportConfig) -> Self { Self { outbound } }
+}
+
+impl Service<Uri> for TransportConnector {
+    type Response = TokioIo<OutboundStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let outbound = self.outbound.clone();
+        Box::pin(async move {
+            let gateway = destination_uri_to_gateway(&dst)?;
+            let stream = connect_gateway_stream(&gateway, &outbound).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+fn destination_uri_to_gateway(dst: &Uri) -> io::Result<GatewayUri> {
+    let scheme = dst.scheme().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Destination URI must include scheme: {dst}"),
+        )
+    })?;
+    let authority = dst.authority().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Destination URI must include authority: {dst}"),
+        )
+    })?;
+
+    GatewayUri::new(scheme, authority).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid destination URI for outbound connection ({dst}): {e}"),
+        )
+    })
 }
 
 async fn connect_tcp(
@@ -276,5 +331,12 @@ mod tests {
     fn reject_invalid_timeout_from_env_value() {
         let err = parse_connect_timeout_secs("invalid").expect_err("must fail");
         assert!(err.to_string().contains("Invalid OUTBOUND_CONNECT_TIMEOUT_SECS value"));
+    }
+
+    #[test]
+    fn destination_uri_requires_scheme() {
+        let uri = Uri::from_static("/relative");
+        let err = destination_uri_to_gateway(&uri).expect_err("must fail");
+        assert!(err.to_string().contains("must include scheme"));
     }
 }

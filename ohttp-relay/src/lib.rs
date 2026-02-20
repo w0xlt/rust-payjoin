@@ -17,9 +17,7 @@ use hyper::header::{
 };
 use hyper::server::conn::http1;
 use hyper::{Method, Request, Response};
-use hyper_rustls::builderstates::WantsSchemes;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
@@ -137,7 +135,8 @@ impl RelayConfig {
         sentinel_tag: SentinelTag,
         outbound_transport: OutboundTransportConfig,
     ) -> Self {
-        Self::new(default_gateway, HttpClient::default(), sentinel_tag, outbound_transport)
+        let client = HttpClient::with_outbound_transport(outbound_transport.clone());
+        Self::new(default_gateway, client, sentinel_tag, outbound_transport)
     }
 
     fn new(
@@ -214,37 +213,56 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) struct HttpClient(
-    hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, hyper::Error>>,
+    hyper_util::client::legacy::Client<
+        HttpsConnector<outbound::TransportConnector>,
+        BoxBody<Bytes, hyper::Error>,
+    >,
 );
 
 impl std::ops::Deref for HttpClient {
     type Target = hyper_util::client::legacy::Client<
-        HttpsConnector<HttpConnector>,
+        HttpsConnector<outbound::TransportConnector>,
         BoxBody<Bytes, hyper::Error>,
     >;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl From<HttpsConnectorBuilder<WantsSchemes>> for HttpClient {
-    fn from(builder: HttpsConnectorBuilder<WantsSchemes>) -> Self {
-        let https = builder.https_or_http().enable_http1().build();
+impl HttpClient {
+    fn with_outbound_transport(outbound_transport: OutboundTransportConfig) -> Self {
+        let transport = outbound::TransportConnector::new(outbound_transport);
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(transport);
         Self(Client::builder(TokioExecutor::new()).build(https))
     }
-}
 
-impl Default for HttpClient {
-    fn default() -> Self { HttpsConnectorBuilder::new().with_webpki_roots().into() }
-}
-
-impl From<rustls::RootCertStore> for HttpClient {
-    fn from(root_store: rustls::RootCertStore) -> Self {
-        HttpsConnectorBuilder::new()
+    fn with_root_store(
+        root_store: rustls::RootCertStore,
+        outbound_transport: OutboundTransportConfig,
+    ) -> Self {
+        let transport = outbound::TransportConnector::new(outbound_transport);
+        let https = HttpsConnectorBuilder::new()
             .with_tls_config(
                 rustls::ClientConfig::builder()
                     .with_root_certificates(root_store)
                     .with_no_client_auth(),
             )
-            .into()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(transport);
+        Self(Client::builder(TokioExecutor::new()).build(https))
+    }
+}
+
+impl Default for HttpClient {
+    fn default() -> Self { Self::with_outbound_transport(OutboundTransportConfig::default()) }
+}
+
+impl From<rustls::RootCertStore> for HttpClient {
+    fn from(root_store: rustls::RootCertStore) -> Self {
+        Self::with_root_store(root_store, OutboundTransportConfig::default())
     }
 }
 
