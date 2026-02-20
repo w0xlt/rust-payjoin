@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use payjoin::io::{FetchOhttpKeysOptions, KeyBootstrapMethod};
 
-use crate::app::config::{BootstrapMode, V2Config};
 use super::Config;
+use crate::app::config::{BootstrapMode, V2Config};
 
 #[derive(Debug, Clone)]
 pub struct RelayManager {
@@ -149,13 +149,12 @@ fn select_bootstrap_method(
     v2_config: &V2Config,
 ) -> Result<KeyBootstrapMethod> {
     match bootstrap_mode {
-        BootstrapMode::Auto => {
+        BootstrapMode::Auto =>
             if is_onion(payjoin_directory) && v2_config.network_proxy.is_some() {
                 Ok(KeyBootstrapMethod::Direct)
             } else {
                 Ok(KeyBootstrapMethod::RelayConnect)
-            }
-        }
+            },
         BootstrapMode::RelayConnect => Ok(KeyBootstrapMethod::RelayConnect),
         BootstrapMode::DirectTor => {
             if v2_config.network_proxy.is_none() {
@@ -180,9 +179,7 @@ fn transport_proxy_for_method(
 }
 
 fn is_onion(url: &url::Url) -> bool {
-    url.domain()
-        .map(|domain| domain.to_ascii_lowercase().ends_with(".onion"))
-        .unwrap_or(false)
+    url.domain().map(|domain| domain.to_ascii_lowercase().ends_with(".onion")).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -246,9 +243,7 @@ mod tests {
         let err =
             select_bootstrap_method(&v2_config.bootstrap_mode, &directory, &v2_config).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("bootstrap_mode=direct_tor requires v2.network_proxy"));
+        assert!(err.to_string().contains("bootstrap_mode=direct_tor requires v2.network_proxy"));
     }
 
     #[test]
@@ -257,10 +252,7 @@ mod tests {
         let v2_config = dummy_v2_config(Some(proxy.clone()), BootstrapMode::DirectTor);
 
         assert_eq!(transport_proxy_for_method(KeyBootstrapMethod::RelayConnect, &v2_config), None);
-        assert_eq!(
-            transport_proxy_for_method(KeyBootstrapMethod::Direct, &v2_config),
-            Some(proxy)
-        );
+        assert_eq!(transport_proxy_for_method(KeyBootstrapMethod::Direct, &v2_config), Some(proxy));
     }
 
     #[test]

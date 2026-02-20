@@ -266,15 +266,11 @@ impl std::error::Error for InternalErrorInner {
 }
 
 impl From<InternalError> for Error {
-    fn from(value: InternalError) -> Self {
-        Self::Internal(value)
-    }
+    fn from(value: InternalError) -> Self { Self::Internal(value) }
 }
 
 impl From<InternalErrorInner> for Error {
-    fn from(value: InternalErrorInner) -> Self {
-        Self::Internal(InternalError(value))
-    }
+    fn from(value: InternalErrorInner) -> Self { Self::Internal(InternalError(value)) }
 }
 
 #[cfg(test)]
@@ -390,10 +386,7 @@ mod tests {
         .await
         .expect_err("direct mode should not require a relay URL");
 
-        assert!(matches!(
-            err,
-            Error::Internal(InternalError(InternalErrorInner::ParseUrl(_)))
-        ));
+        assert!(matches!(err, Error::Internal(InternalError(InternalErrorInner::ParseUrl(_)))));
     }
 
     #[tokio::test]
@@ -410,9 +403,6 @@ mod tests {
             .await
             .expect_err("invalid transport proxy scheme should fail");
 
-        assert!(matches!(
-            err,
-            Error::Internal(InternalError(InternalErrorInner::Reqwest(_)))
-        ));
+        assert!(matches!(err, Error::Internal(InternalError(InternalErrorInner::Reqwest(_)))));
     }
 }
