@@ -18,6 +18,30 @@ Alternatively, set `UNIX_SOCKET` to bind to a unix socket path instead of a TCP 
 
 This crate is intended to be run behind a reverse proxy like NGINX that can handle TLS for you. Tests specifically cover this integration using `nginx.conf.template`.
 
+## Outbound Proxy (Tor Egress)
+
+To route relay egress (relay -> directory/gateway) through Tor, set a SOCKS5h
+proxy:
+
+```console
+OUTBOUND_PROXY='socks5h://127.0.0.1:9050' cargo run
+```
+
+Optional connect timeout (seconds):
+
+```console
+OUTBOUND_PROXY='socks5h://127.0.0.1:9050' \
+OUTBOUND_CONNECT_TIMEOUT_SECS=10 \
+cargo run
+```
+
+Notes:
+
+- `OUTBOUND_PROXY` must use the `socks5h://` scheme to ensure remote DNS
+  resolution by the proxy.
+- This configuration applies to both OHTTP request forwarding and bootstrap
+  CONNECT/WebSocket tunnels.
+
 ## Bootstrap Feature
 
 The Oblivious HTTP specification requires clients obtain a [Key Configuration](https://www.ietf.org/rfc/rfc9458.html#name-key-configuration) from the OHTTP Gateway but leaves a mechanism for doing so explicitly unspecified. This feature hosts HTTPS-in-WebSocket and HTTPS-in-CONNECT proxies to allow web clients to GET a gateway's ohttp-keys via [Direct Discovery](https://datatracker.ietf.org/doc/html/draft-ietf-privacypass-key-consistency-01#name-direct-discovery) in an end-to-end-encrypted, authenticated manner using the OHTTP relay as a tunnel so as not to reveal their IP address. The `bootstrap` feature to host these proxies is enabled by default. The `ws-bootstrap` and `connect-bootstrap` features enable each proxy individually.
