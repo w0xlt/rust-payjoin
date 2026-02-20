@@ -379,4 +379,40 @@ mod tests {
 
         assert_eq!(err.to_string(), "Transport proxy with relay bootstrap mode is not supported");
     }
+
+    #[tokio::test]
+    async fn test_direct_mode_does_not_require_relay_url() {
+        let err = fetch_ohttp_keys_with_options(
+            None::<&str>,
+            "not a valid url",
+            FetchOhttpKeysOptions::direct(),
+        )
+        .await
+        .expect_err("direct mode should not require a relay URL");
+
+        assert!(matches!(
+            err,
+            Error::Internal(InternalError(InternalErrorInner::ParseUrl(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_direct_mode_rejects_invalid_transport_proxy_scheme() {
+        let options = FetchOhttpKeysOptions {
+            key_bootstrap_method: KeyBootstrapMethod::Direct,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            transport_proxy: Some(
+                url::Url::parse("ftp://127.0.0.1:21").expect("proxy URL should parse"),
+            ),
+        };
+
+        let err = fetch_ohttp_keys_with_options(None::<&str>, "https://directory.example", options)
+            .await
+            .expect_err("invalid transport proxy scheme should fail");
+
+        assert!(matches!(
+            err,
+            Error::Internal(InternalError(InternalErrorInner::Reqwest(_)))
+        ));
+    }
 }
