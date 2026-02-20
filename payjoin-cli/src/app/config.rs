@@ -193,7 +193,10 @@ impl Config {
                 #[cfg(feature = "v2")]
                 {
                     match built_config.get::<V2Config>("v2") {
-                        Ok(v2) => config.version = Some(VersionConfig::V2(v2)),
+                        Ok(v2) => {
+                            validate_v2_config(&v2)?;
+                            config.version = Some(VersionConfig::V2(v2));
+                        }
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V2 configuration is required for BIP77 mode: {e}"
@@ -372,5 +375,79 @@ where
                 })
             })
             .map(Some),
+    }
+}
+
+#[cfg(feature = "v2")]
+fn validate_v2_config(v2: &V2Config) -> Result<(), ConfigError> {
+    if let Some(network_proxy) = v2.network_proxy.as_ref() {
+        validate_network_proxy_scheme(network_proxy)?;
+    }
+
+    if matches!(v2.bootstrap_mode, BootstrapMode::DirectTor) && v2.network_proxy.is_none() {
+        return Err(ConfigError::Message(
+            "v2.bootstrap_mode=direct_tor requires v2.network_proxy to be configured".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "v2")]
+fn validate_network_proxy_scheme(proxy_url: &Url) -> Result<(), ConfigError> {
+    match proxy_url.scheme() {
+        "socks5h" => Ok(()),
+        "socks5" => {
+            tracing::warn!(
+                "v2.network_proxy uses socks5://; prefer socks5h:// to avoid local DNS leakage"
+            );
+            Ok(())
+        }
+        "http" | "https" => Ok(()),
+        scheme => Err(ConfigError::Message(format!(
+            "Unsupported v2.network_proxy scheme '{scheme}'. Supported schemes: \
+             socks5h, socks5, http, https"
+        ))),
+    }
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_supported_network_proxy_schemes() {
+        for proxy in [
+            "socks5h://127.0.0.1:9050",
+            "socks5://127.0.0.1:9050",
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1:8080",
+        ] {
+            let proxy_url = Url::parse(proxy).unwrap();
+            assert!(validate_network_proxy_scheme(&proxy_url).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_network_proxy_schemes() {
+        let proxy_url = Url::parse("ftp://127.0.0.1:21").unwrap();
+        let err = validate_network_proxy_scheme(&proxy_url).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Unsupported v2.network_proxy scheme"));
+    }
+
+    #[test]
+    fn direct_tor_requires_network_proxy() {
+        let v2 = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![Url::parse("https://relay.example").unwrap()],
+            pj_directory: Url::parse("https://payjo.in").unwrap(),
+            network_proxy: None,
+            bootstrap_mode: BootstrapMode::DirectTor,
+        };
+
+        let err = validate_v2_config(&v2).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("v2.bootstrap_mode=direct_tor requires v2.network_proxy"));
     }
 }
