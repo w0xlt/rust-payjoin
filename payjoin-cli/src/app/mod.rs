@@ -64,12 +64,26 @@ pub trait App: Send + Sync {
 
 #[cfg(feature = "_manual-tls")]
 fn http_agent(config: &Config) -> Result<reqwest::Client> {
-    Ok(http_agent_builder(config.root_certificate.as_ref())?.build()?)
+    let mut builder = http_agent_builder(config.root_certificate.as_ref())?;
+    #[cfg(feature = "v2")]
+    if let Ok(v2_config) = config.v2() {
+        if let Some(proxy) = v2_config.network_proxy.as_ref() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.as_str())?);
+        }
+    }
+    Ok(builder.build()?)
 }
 
 #[cfg(not(feature = "_manual-tls"))]
-fn http_agent(_config: &Config) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder().http1_only().build()?)
+fn http_agent(config: &Config) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().http1_only();
+    #[cfg(feature = "v2")]
+    if let Ok(v2_config) = config.v2() {
+        if let Some(proxy) = v2_config.network_proxy.as_ref() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.as_str())?);
+        }
+    }
+    Ok(builder.build()?)
 }
 
 #[cfg(feature = "_manual-tls")]

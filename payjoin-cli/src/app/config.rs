@@ -37,6 +37,7 @@ pub struct V2Config {
     pub ohttp_keys: Option<payjoin::OhttpKeys>,
     pub ohttp_relays: Vec<Url>,
     pub pj_directory: Url,
+    pub network_proxy: Option<Url>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -271,11 +272,13 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     // Set default values
     let config = config
         .set_default("v2.pj_directory", "https://payjo.in")?
-        .set_default("v2.ohttp_keys", None::<String>)?;
+        .set_default("v2.ohttp_keys", None::<String>)?
+        .set_default("v2.network_proxy", None::<String>)?;
 
     // Override config values with command line arguments if applicable
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let network_proxy = cli.network_proxy.as_ref().map(|s| s.as_str());
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
@@ -284,6 +287,7 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     config
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
+        .set_override_option("v2.network_proxy", network_proxy)?
         .set_override_option("v2.ohttp_relays", ohttp_relays)
 }
 
