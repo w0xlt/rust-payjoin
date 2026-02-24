@@ -16,3 +16,23 @@ server](https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#unsecured
 in order to provide backwards-compatible support for [BIP
 78](https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki) Payjoin (v1)
 clients.
+
+## Tor Native Operation
+
+For Tor-native BIP77 deployments:
+
+- Expose the directory as an onion service
+- Keep relay and directory logically separate (service/process/operator)
+- Route relay egress to directory through SOCKS5h on the relay side
+
+Clients can bootstrap keys directly from the directory over Tor using
+`/.well-known/ohttp-gateway` as defined by RFC 9540.
+
+## OHTTP Key Management
+
+Operational guidance:
+
+- Keep OHTTP key storage on persistent disk
+- Plan key rotations with overlap windows so active clients can complete
+  sessions during rollout
+- Monitor bootstrap and decapsulation failures during rotation windows

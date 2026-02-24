@@ -58,6 +58,12 @@ rpcpassword = "password"
 # # - "relay_connect": always bootstrap keys through the selected relay.
 # # - "direct_tor": bootstrap keys directly from the directory via network_proxy.
 # # bootstrap_mode = "auto"
+# #
+# # Tor-native onion example:
+# # pj_directory = "http://directoryexampleabcdefghijklmnop.onion"
+# # ohttp_relays = ["http://relayexampleabcdefghijklmnop.onion"]
+# # network_proxy = "socks5h://127.0.0.1:9050"
+# # bootstrap_mode = "auto"
 # # Optional: The HPKE keys which need to be fetched ahead of time from the pj_endpoint
 # # for the payjoin packets to be encrypted.
 # # These can now be fetched and no longer need to be configured.

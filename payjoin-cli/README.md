@@ -143,8 +143,33 @@ Congratulations! You've completed a version 2 payjoin, which can be used for che
 Config options can be passed from the command line, or manually edited in a `config.toml` file within the directory you run `payjoin-cli` from.
 
 See the
-[example.config.toml](https://github.com/payjoin/rust-payjoin/blob/fde867b93ede767c9a50913432a73782a94ef40b/payjoin-cli/example.config.toml)
+[example.config.toml](./example.config.toml)
 for inspiration.
+
+### Tor Native BIP77 Configuration
+
+For onion-based BIP77 operation, set:
+
+```toml
+[v2]
+pj_directory = "http://directoryexampleabcdefghijklmnop.onion"
+ohttp_relays = ["http://relayexampleabcdefghijklmnop.onion"]
+network_proxy = "socks5h://127.0.0.1:9050"
+bootstrap_mode = "auto" # auto | relay_connect | direct_tor
+```
+
+Mode behavior:
+
+- `auto` (default): chooses `direct_tor` when an onion directory and
+  `network_proxy` are configured, otherwise uses `relay_connect`.
+- `relay_connect`: bootstrap keys through relay CONNECT/WebSocket tunnel.
+- `direct_tor`: bootstrap keys directly from the directory over Tor.
+
+Operational notes:
+
+- Prefer `socks5h://` over `socks5://` to avoid local DNS leakage.
+- `direct_tor` requires `network_proxy` to be configured.
+- Existing HTTPS deployment paths continue to work unchanged.
 
 ### Asynchronous Operation
 

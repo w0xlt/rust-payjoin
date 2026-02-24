@@ -8,15 +8,18 @@ implementations. Use at your own risk.
 
 ## Usage
 
-Run ohttp-relay by setting `PORT` and `GATEWAY_ORIGIN` environment variables. For example, to relay from port 3000 to an OHTTP Gateway Resource at `https://payjo.in`, run the following.
+Run ohttp-relay by setting `PORT` (or `UNIX_SOCKET`):
 
 ```console
-PORT=3000 GATEWAY_ORIGIN='https://payjo.in' cargo run
+PORT=3000 cargo run
 ```
 
 Alternatively, set `UNIX_SOCKET` to bind to a unix socket path instead of a TCP port.
 
-This crate is intended to be run behind a reverse proxy like NGINX that can handle TLS for you. Tests specifically cover this integration using `nginx.conf.template`.
+`GATEWAY_URI` is deprecated and, if set, must remain `https://payjo.in`.
+
+This crate is intended to run behind a reverse proxy such as NGINX for inbound
+TLS handling. Tests cover this integration using `nginx.conf.template`.
 
 ## Outbound Proxy (Tor Egress)
 
@@ -41,6 +44,16 @@ Notes:
   resolution by the proxy.
 - This configuration applies to both OHTTP request forwarding and bootstrap
   CONNECT/WebSocket tunnels.
+
+## Tor Native Deployment Notes
+
+For relay -> directory onion routing:
+
+- Set `OUTBOUND_PROXY=socks5h://127.0.0.1:9050`
+- Keep relay and directory as separate services/operators when possible
+- Expose relay and directory on distinct onion addresses
+
+Using `socks5h` is required to avoid local DNS resolution for onion targets.
 
 ## Bootstrap Feature
 
