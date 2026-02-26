@@ -27,10 +27,12 @@ struct Services {
 
 pub async fn serve(config: Config, meter_provider: Option<SdkMeterProvider>) -> anyhow::Result<()> {
     let sentinel_tag = generate_sentinel_tag();
+    let relay_outbound = config.relay_outbound_transport()?;
 
     let services = Services {
         directory: init_directory(&config, sentinel_tag).await?,
-        relay: ohttp_relay::Service::new(sentinel_tag).await,
+        relay: ohttp_relay::Service::new_with_outbound_transport(sentinel_tag, relay_outbound)
+            .await,
         metrics: MetricsService::new(meter_provider),
     };
 
@@ -61,10 +63,16 @@ pub async fn serve_manual_tls(
     use std::net::SocketAddr;
 
     let sentinel_tag = generate_sentinel_tag();
+    let relay_outbound = config.relay_outbound_transport()?;
 
     let services = Services {
         directory: init_directory(&config, sentinel_tag).await?,
-        relay: ohttp_relay::Service::new_with_roots(root_store, sentinel_tag).await,
+        relay: ohttp_relay::Service::new_with_roots_and_outbound(
+            root_store,
+            sentinel_tag,
+            relay_outbound,
+        )
+        .await,
         metrics: MetricsService::new(None),
     };
     let app = build_app(services);
@@ -114,10 +122,12 @@ pub async fn serve_acme(
         .ok_or_else(|| anyhow::anyhow!("ACME configuration is required for serve_acme"))?;
 
     let sentinel_tag = generate_sentinel_tag();
+    let relay_outbound = config.relay_outbound_transport()?;
 
     let services = Services {
         directory: init_directory(&config, sentinel_tag).await?,
-        relay: ohttp_relay::Service::new(sentinel_tag).await,
+        relay: ohttp_relay::Service::new_with_outbound_transport(sentinel_tag, relay_outbound)
+            .await,
         metrics: MetricsService::new(meter_provider),
     };
     let app = build_app(services);

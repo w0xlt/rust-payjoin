@@ -71,6 +71,7 @@ Component configuration references:
 - [payjoin-cli Tor config](./payjoin-cli/README.md)
 - [ohttp-relay outbound proxy settings](./ohttp-relay/README.md)
 - [payjoin-directory operations](./payjoin-directory/README.md)
+- [payjoin-mailroom single-binary Tor config](./payjoin-mailroom/README.md)
 
 ## Minimum Supported Rust Version (MSRV)
 

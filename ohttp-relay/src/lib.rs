@@ -160,16 +160,20 @@ impl Service {
     fn from_config(config: Arc<RelayConfig>) -> Self { Self { config } }
 
     pub async fn new(sentinel_tag: SentinelTag) -> Self {
+        Self::new_with_outbound_transport(sentinel_tag, OutboundTransportConfig::default()).await
+    }
+
+    pub async fn new_with_outbound_transport(
+        sentinel_tag: SentinelTag,
+        outbound_transport: OutboundTransportConfig,
+    ) -> Self {
         // The default gateway is hardcoded because it is obsolete and required only for backwards
         // compatibility.
         // The new mechanism for specifying a custom gateway is via RFC 9540 using
         // `/.well-known/ohttp-gateway` request paths.
         let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
-        let config = RelayConfig::new_with_default_client(
-            gateway_origin,
-            sentinel_tag,
-            OutboundTransportConfig::default(),
-        );
+        let config =
+            RelayConfig::new_with_default_client(gateway_origin, sentinel_tag, outbound_transport);
         config.prober.assert_opt_in(&config.default_gateway).await;
         Self { config: Arc::new(config) }
     }
@@ -179,13 +183,22 @@ impl Service {
         root_store: rustls::RootCertStore,
         sentinel_tag: SentinelTag,
     ) -> Self {
-        let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
-        let config = RelayConfig::new(
-            gateway_origin,
+        Self::new_with_roots_and_outbound(
             root_store,
             sentinel_tag,
             OutboundTransportConfig::default(),
-        );
+        )
+        .await
+    }
+
+    #[cfg(feature = "_test-util")]
+    pub async fn new_with_roots_and_outbound(
+        root_store: rustls::RootCertStore,
+        sentinel_tag: SentinelTag,
+        outbound_transport: OutboundTransportConfig,
+    ) -> Self {
+        let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
+        let config = RelayConfig::new(gateway_origin, root_store, sentinel_tag, outbound_transport);
         config.prober.assert_opt_in(&config.default_gateway).await;
         Self { config: Arc::new(config) }
     }
