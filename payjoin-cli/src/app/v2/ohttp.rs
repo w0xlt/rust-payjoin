@@ -10,6 +10,7 @@ const ONION_PROXY_REQUIRED_ERR: &str =
     "v2.pj_directory is an onion endpoint but v2.network_proxy is not configured. \
      Refusing clearnet fallback; set v2.network_proxy to socks5h://127.0.0.1:9050";
 const DIRECT_BOOTSTRAP_ATTEMPTS: usize = 2;
+const MAX_RELAY_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct RelayManager {
@@ -116,7 +117,8 @@ async fn fetch_ohttp_keys(
         }
     }
 
-    loop {
+    let mut last_error = None;
+    for attempt in 1..=MAX_RELAY_ATTEMPTS {
         let failed_relays =
             relay_manager.lock().expect("Lock should not be poisoned").get_failed_relays();
 
@@ -124,13 +126,13 @@ async fn fetch_ohttp_keys(
             relays.iter().filter(|r| !failed_relays.contains(r)).cloned().collect();
 
         if remaining_relays.is_empty() {
-            return Err(anyhow!("No valid relays available"));
+            break;
         }
 
         let selected_relay =
             match remaining_relays.choose(&mut payjoin::bitcoin::key::rand::thread_rng()) {
                 Some(relay) => relay.clone(),
-                None => return Err(anyhow!("Failed to select from remaining relays")),
+                None => break,
             };
 
         relay_manager
@@ -174,13 +176,22 @@ async fn fetch_ohttp_keys(
                 return Err(payjoin::io::Error::UnexpectedStatusCode(status).into());
             }
             Err(e) => {
-                tracing::debug!("Failed to connect to relay: {selected_relay}, {e:?}");
+                tracing::debug!(
+                    "Relay bootstrap attempt {attempt}/{MAX_RELAY_ATTEMPTS} \
+                     failed for relay {selected_relay}: {e:?}"
+                );
                 relay_manager
                     .lock()
                     .expect("Lock should not be poisoned")
                     .add_failed_relay(selected_relay);
+                last_error = Some(e);
             }
         }
+    }
+
+    match last_error {
+        Some(e) => Err(anyhow!("All relay bootstrap attempts exhausted: {e}")),
+        None => Err(anyhow!("No valid relays available")),
     }
 }
 
