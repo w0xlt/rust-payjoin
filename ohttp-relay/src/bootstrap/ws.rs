@@ -115,6 +115,11 @@ where
     Ok(())
 }
 
+/// Maximum bytes buffered from a single WebSocket frame before back-pressure
+/// is applied.  OHTTP key payloads are small, so 1 MiB is generous while
+/// still preventing unbounded memory growth from oversized frames.
+const MAX_WS_READ_BUFFER: usize = 1 << 20; // 1 MiB
+
 pub struct WsIo<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -154,6 +159,12 @@ where
         match self_mut.ws_stream.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(message))) => match message {
                 Message::Binary(data) => {
+                    if self_mut.read_buffer.len().saturating_add(data.len()) > MAX_WS_READ_BUFFER {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "WebSocket read buffer exceeded 1 MiB limit",
+                        )));
+                    }
                     self_mut.read_buffer.extend_from_slice(&data);
                     let len = std::cmp::min(buf.remaining(), self_mut.read_buffer.len());
                     buf.put_slice(&self_mut.read_buffer[..len]);
