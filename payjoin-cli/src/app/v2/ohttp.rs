@@ -97,8 +97,10 @@ async fn fetch_ohttp_keys(
                 Ok(ohttp_keys) => {
                     return Ok(ValidatedOhttpKeys { ohttp_keys, relay_url: selected_relay });
                 }
-                Err(payjoin::io::Error::UnexpectedStatusCode(e)) => {
-                    return Err(payjoin::io::Error::UnexpectedStatusCode(e).into());
+                Err(payjoin::io::Error::UnexpectedStatusCode(status))
+                    if !status.is_server_error() =>
+                {
+                    return Err(payjoin::io::Error::UnexpectedStatusCode(status).into());
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -168,8 +170,8 @@ async fn fetch_ohttp_keys(
         match ohttp_keys {
             Ok(keys) =>
                 return Ok(ValidatedOhttpKeys { ohttp_keys: keys, relay_url: selected_relay }),
-            Err(payjoin::io::Error::UnexpectedStatusCode(e)) => {
-                return Err(payjoin::io::Error::UnexpectedStatusCode(e).into());
+            Err(payjoin::io::Error::UnexpectedStatusCode(status)) if !status.is_server_error() => {
+                return Err(payjoin::io::Error::UnexpectedStatusCode(status).into());
             }
             Err(e) => {
                 tracing::debug!("Failed to connect to relay: {selected_relay}, {e:?}");
