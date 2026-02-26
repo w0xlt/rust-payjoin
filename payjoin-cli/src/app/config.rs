@@ -389,16 +389,15 @@ fn is_onion(url: &Url) -> bool {
 fn validate_network_proxy_scheme(proxy_url: &Url) -> Result<(), ConfigError> {
     match proxy_url.scheme() {
         "socks5h" => Ok(()),
-        "socks5" => {
-            tracing::warn!(
-                "v2.network_proxy uses socks5://; prefer socks5h:// to avoid local DNS leakage"
-            );
-            Ok(())
-        }
+        "socks5" => Err(ConfigError::Message(
+            "v2.network_proxy uses socks5:// which leaks DNS queries locally. \
+             Use socks5h:// so the proxy resolves hostnames remotely"
+                .to_string(),
+        )),
         "http" | "https" => Ok(()),
         scheme => Err(ConfigError::Message(format!(
             "Unsupported v2.network_proxy scheme '{scheme}'. Supported schemes: \
-             socks5h, socks5, http, https"
+             socks5h, http, https"
         ))),
     }
 }
@@ -409,15 +408,19 @@ mod tests {
 
     #[test]
     fn accepts_supported_network_proxy_schemes() {
-        for proxy in [
-            "socks5h://127.0.0.1:9050",
-            "socks5://127.0.0.1:9050",
-            "http://127.0.0.1:8080",
-            "https://127.0.0.1:8080",
-        ] {
+        for proxy in ["socks5h://127.0.0.1:9050", "http://127.0.0.1:8080", "https://127.0.0.1:8080"]
+        {
             let proxy_url = Url::parse(proxy).unwrap();
             assert!(validate_network_proxy_scheme(&proxy_url).is_ok());
         }
+    }
+
+    #[test]
+    fn rejects_socks5_without_remote_dns() {
+        let proxy_url = Url::parse("socks5://127.0.0.1:9050").unwrap();
+        let err = validate_network_proxy_scheme(&proxy_url).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("socks5h://"));
     }
 
     #[test]

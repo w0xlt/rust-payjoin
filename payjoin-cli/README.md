@@ -160,7 +160,8 @@ Bootstrap behavior:
 
 Operational notes:
 
-- Prefer `socks5h://` over `socks5://` to avoid local DNS leakage.
+- Use `socks5h://` (not `socks5://`) to avoid local DNS leakage.
+  `socks5://` is rejected at startup.
 - Onion `pj_directory` without `network_proxy` fails loudly to avoid
   accidental clearnet fallback.
 - Existing HTTPS deployment paths continue to work unchanged.
