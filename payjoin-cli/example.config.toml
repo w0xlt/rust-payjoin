@@ -52,18 +52,12 @@ rpcpassword = "password"
 # ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com", "https://example.com"]
 # # Optional: Use an outbound proxy (for example Tor SOCKS5 with remote DNS)
 # # network_proxy = "socks5h://127.0.0.1:9050"
-# # Optional: OHTTP key bootstrap mode.
-# # - "auto" (default): use direct_tor for onion directories when network_proxy is set;
-# #   otherwise use relay_connect.
-# # - "relay_connect": always bootstrap keys through the selected relay.
-# # - "direct_tor": bootstrap keys directly from the directory via network_proxy.
-# # bootstrap_mode = "auto"
 # #
 # # Tor-native onion example:
 # # pj_directory = "http://directoryexampleabcdefghijklmnop.onion"
 # # ohttp_relays = ["http://relayexampleabcdefghijklmnop.onion"]
 # # network_proxy = "socks5h://127.0.0.1:9050"
-# # bootstrap_mode = "auto"
+# # Onion directory requires network_proxy; otherwise payjoin-cli fails loudly.
 # # Optional: The HPKE keys which need to be fetched ahead of time from the pj_endpoint
 # # for the payjoin packets to be encrypted.
 # # These can now be fetched and no longer need to be configured.

@@ -80,14 +80,6 @@ pub struct Cli {
     #[arg(long = "network-proxy", help = "Optional outbound proxy URL (for example socks5h://127.0.0.1:9050)", value_parser = value_parser!(Url))]
     pub network_proxy: Option<Url>,
 
-    #[cfg(feature = "v2")]
-    #[arg(
-        long = "bootstrap-mode",
-        help = "OHTTP key bootstrap mode: auto, relay_connect, or direct_tor",
-        value_parser = ["auto", "relay_connect", "direct_tor"]
-    )]
-    pub bootstrap_mode: Option<String>,
-
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
     pub root_certificate: Option<PathBuf>,

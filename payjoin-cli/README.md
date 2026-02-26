@@ -79,8 +79,6 @@ pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
 # Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
 network_proxy = "socks5h://127.0.0.1:9050"
-# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
-bootstrap_mode = "auto"
 ```
 
 #### `receiver/config.toml`
@@ -98,8 +96,6 @@ pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
 # Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
 network_proxy = "socks5h://127.0.0.1:9050"
-# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
-bootstrap_mode = "auto"
 ```
 
 Now, the receiver must generate an address to receive the payment. The format is:
@@ -155,20 +151,18 @@ For onion-based BIP77 operation, set:
 pj_directory = "http://directoryexampleabcdefghijklmnop.onion"
 ohttp_relays = ["http://relayexampleabcdefghijklmnop.onion"]
 network_proxy = "socks5h://127.0.0.1:9050"
-bootstrap_mode = "auto" # auto | relay_connect | direct_tor
 ```
 
-Mode behavior:
+Bootstrap behavior:
 
-- `auto` (default): chooses `direct_tor` when an onion directory and
-  `network_proxy` are configured, otherwise uses `relay_connect`.
-- `relay_connect`: bootstrap keys through relay CONNECT/WebSocket tunnel.
-- `direct_tor`: bootstrap keys directly from the directory over Tor.
+- Onion `pj_directory` uses direct key bootstrap over `network_proxy`.
+- Non-onion `pj_directory` uses relay CONNECT/WebSocket key bootstrap.
 
 Operational notes:
 
 - Prefer `socks5h://` over `socks5://` to avoid local DNS leakage.
-- `direct_tor` requires `network_proxy` to be configured.
+- Onion `pj_directory` without `network_proxy` fails loudly to avoid
+  accidental clearnet fallback.
 - Existing HTTPS deployment paths continue to work unchanged.
 
 ### Asynchronous Operation
