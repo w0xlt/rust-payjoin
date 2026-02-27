@@ -374,9 +374,9 @@ fn parse_gateway_uri_from_path(path: &str, default: &GatewayUri) -> Result<Gatew
         return Ok(default.clone());
     }
 
-    let path = &path[1..];
+    let path = path.strip_prefix('/').unwrap_or(path);
 
-    if "http://" == &path[..7] || "https://" == &path[..8] {
+    if path.starts_with("http://") || path.starts_with("https://") {
         GatewayUri::from_str(path)
     } else {
         Ok(Authority::from_str(path)?.into())
@@ -471,4 +471,51 @@ pub(crate) fn empty() -> BoxBody<Bytes, hyper::Error> {
 
 pub(crate) fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into()).map_err(|never| match never {}).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn parse_gateway_uri_from_path_uses_default_for_empty_paths() {
+        let default = GatewayUri::from_static("https://default.example");
+        assert_eq!(
+            parse_gateway_uri_from_path("", &default).expect("empty path uses default"),
+            default
+        );
+        assert_eq!(
+            parse_gateway_uri_from_path("/", &default).expect("slash path uses default"),
+            default
+        );
+    }
+
+    #[test]
+    fn parse_gateway_uri_from_path_accepts_absolute_gateway_uri() {
+        let default = GatewayUri::from_static("https://default.example");
+        let parsed = parse_gateway_uri_from_path("/https://gateway.example", &default)
+            .expect("absolute gateway uri should parse");
+        assert_eq!(parsed, GatewayUri::from_static("https://gateway.example"));
+    }
+
+    #[test]
+    fn parse_gateway_uri_from_path_handles_short_values_without_panicking() {
+        let default = GatewayUri::from_static("https://default.example");
+        let parsed = parse_gateway_uri_from_path("/h", &default)
+            .expect("short path should be parsed as an authority");
+        assert_eq!(
+            parsed,
+            GatewayUri::from_str("https://h").expect("authority should normalize to https")
+        );
+    }
+
+    #[test]
+    fn parse_gateway_uri_from_path_rejects_invalid_absolute_uri() {
+        let default = GatewayUri::from_static("https://default.example");
+        let err =
+            parse_gateway_uri_from_path("/http://", &default).expect_err("invalid URI must fail");
+        assert!(!err.to_string().is_empty(), "error should include context");
+    }
 }
