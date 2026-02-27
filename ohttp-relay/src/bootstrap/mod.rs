@@ -6,7 +6,7 @@ use hyper::{Request, Response};
 use tracing::instrument;
 
 use crate::error::Error;
-use crate::GatewayUri;
+use crate::{GatewayUri, OutboundTransportConfig};
 
 #[cfg(feature = "connect-bootstrap")]
 pub mod connect;
@@ -18,18 +18,19 @@ pub mod ws;
 pub(crate) async fn handle_ohttp_keys<B>(
     req: Request<B>,
     gateway_origin: GatewayUri,
+    outbound_transport: &OutboundTransportConfig,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Error>
 where
     B: Send + Debug + 'static,
 {
     #[cfg(feature = "connect-bootstrap")]
     if connect::is_connect_request(&req) {
-        return connect::try_upgrade(req, gateway_origin).await;
+        return connect::try_upgrade(req, gateway_origin, outbound_transport).await;
     }
 
     #[cfg(feature = "ws-bootstrap")]
     if ws::is_websocket_request(&req) {
-        return ws::try_upgrade(req, gateway_origin).await;
+        return ws::try_upgrade(req, gateway_origin, outbound_transport).await;
     }
 
     Err(Error::BadRequest("Not a supported proxy upgrade request".to_string()))
