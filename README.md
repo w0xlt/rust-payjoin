@@ -55,6 +55,24 @@ Currently supported languages:
 - Javascript
 - Python
 
+## Tor Native BIP77 Deployment
+
+rust-payjoin supports Tor-native Async Payjoin (BIP77) deployments while
+preserving existing HTTPS workflows as default behavior.
+
+Recommended topology:
+
+- Wallet -> relay onion service over local Tor SOCKS5h
+- Relay -> directory onion service over relay SOCKS5h egress
+- Directory and relay operated separately
+
+Component configuration references:
+
+- [payjoin-cli Tor config](./payjoin-cli/README.md)
+- [ohttp-relay outbound proxy settings](./ohttp-relay/README.md)
+- [payjoin-directory operations](./payjoin-directory/README.md)
+- [payjoin-mailroom single-binary Tor config](./payjoin-mailroom/README.md)
+
 ## Minimum Supported Rust Version (MSRV)
 
 All crates in this repository should always compile with any combination of features on Rust **1.85.0**.
