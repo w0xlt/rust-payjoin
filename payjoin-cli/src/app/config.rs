@@ -38,18 +38,6 @@ pub struct V2Config {
     pub ohttp_relays: Vec<Url>,
     pub pj_directory: Url,
     pub network_proxy: Option<Url>,
-    #[serde(default)]
-    pub bootstrap_mode: BootstrapMode,
-}
-
-#[cfg(feature = "v2")]
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BootstrapMode {
-    #[default]
-    Auto,
-    RelayConnect,
-    DirectTor,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -288,14 +276,12 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     let config = config
         .set_default("v2.pj_directory", "https://payjo.in")?
         .set_default("v2.ohttp_keys", None::<String>)?
-        .set_default("v2.network_proxy", None::<String>)?
-        .set_default("v2.bootstrap_mode", "auto")?;
+        .set_default("v2.network_proxy", None::<String>)?;
 
     // Override config values with command line arguments if applicable
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
     let network_proxy = cli.network_proxy.as_ref().map(|s| s.as_str());
-    let bootstrap_mode = cli.bootstrap_mode.as_deref();
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
@@ -305,7 +291,6 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
         .set_override_option("v2.network_proxy", network_proxy)?
-        .set_override_option("v2.bootstrap_mode", bootstrap_mode)?
         .set_override_option("v2.ohttp_relays", ohttp_relays)
 }
 
@@ -384,9 +369,11 @@ fn validate_v2_config(v2: &V2Config) -> Result<(), ConfigError> {
         validate_network_proxy_scheme(network_proxy)?;
     }
 
-    if matches!(v2.bootstrap_mode, BootstrapMode::DirectTor) && v2.network_proxy.is_none() {
+    if is_onion(&v2.pj_directory) && v2.network_proxy.is_none() {
         return Err(ConfigError::Message(
-            "v2.bootstrap_mode=direct_tor requires v2.network_proxy to be configured".to_string(),
+            "v2.pj_directory is an onion endpoint but v2.network_proxy is not configured. \
+             Refusing clearnet fallback; set v2.network_proxy to socks5h://127.0.0.1:9050"
+                .to_string(),
         ));
     }
 
@@ -394,19 +381,23 @@ fn validate_v2_config(v2: &V2Config) -> Result<(), ConfigError> {
 }
 
 #[cfg(feature = "v2")]
+fn is_onion(url: &Url) -> bool {
+    url.domain().map(|domain| domain.to_ascii_lowercase().ends_with(".onion")).unwrap_or(false)
+}
+
+#[cfg(feature = "v2")]
 fn validate_network_proxy_scheme(proxy_url: &Url) -> Result<(), ConfigError> {
     match proxy_url.scheme() {
         "socks5h" => Ok(()),
-        "socks5" => {
-            tracing::warn!(
-                "v2.network_proxy uses socks5://; prefer socks5h:// to avoid local DNS leakage"
-            );
-            Ok(())
-        }
+        "socks5" => Err(ConfigError::Message(
+            "v2.network_proxy uses socks5:// which leaks DNS queries locally. \
+             Use socks5h:// so the proxy resolves hostnames remotely"
+                .to_string(),
+        )),
         "http" | "https" => Ok(()),
         scheme => Err(ConfigError::Message(format!(
             "Unsupported v2.network_proxy scheme '{scheme}'. Supported schemes: \
-             socks5h, socks5, http, https"
+             socks5h, http, https"
         ))),
     }
 }
@@ -417,15 +408,19 @@ mod tests {
 
     #[test]
     fn accepts_supported_network_proxy_schemes() {
-        for proxy in [
-            "socks5h://127.0.0.1:9050",
-            "socks5://127.0.0.1:9050",
-            "http://127.0.0.1:8080",
-            "https://127.0.0.1:8080",
-        ] {
+        for proxy in ["socks5h://127.0.0.1:9050", "http://127.0.0.1:8080", "https://127.0.0.1:8080"]
+        {
             let proxy_url = Url::parse(proxy).unwrap();
             assert!(validate_network_proxy_scheme(&proxy_url).is_ok());
         }
+    }
+
+    #[test]
+    fn rejects_socks5_without_remote_dns() {
+        let proxy_url = Url::parse("socks5://127.0.0.1:9050").unwrap();
+        let err = validate_network_proxy_scheme(&proxy_url).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("socks5h://"));
     }
 
     #[test]
@@ -437,17 +432,28 @@ mod tests {
     }
 
     #[test]
-    fn direct_tor_requires_network_proxy() {
+    fn onion_directory_requires_network_proxy() {
+        let v2 = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![Url::parse("https://relay.example").unwrap()],
+            pj_directory: Url::parse("http://directoryexample1234567890.onion").unwrap(),
+            network_proxy: None,
+        };
+
+        let err = validate_v2_config(&v2).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("v2.pj_directory is an onion endpoint"));
+    }
+
+    #[test]
+    fn non_onion_directory_allows_missing_proxy() {
         let v2 = V2Config {
             ohttp_keys: None,
             ohttp_relays: vec![Url::parse("https://relay.example").unwrap()],
             pj_directory: Url::parse("https://payjo.in").unwrap(),
             network_proxy: None,
-            bootstrap_mode: BootstrapMode::DirectTor,
         };
 
-        let err = validate_v2_config(&v2).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("v2.bootstrap_mode=direct_tor requires v2.network_proxy"));
+        assert!(validate_v2_config(&v2).is_ok());
     }
 }
