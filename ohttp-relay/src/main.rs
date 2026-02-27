@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use ohttp_relay::{GatewayUri, DEFAULT_GATEWAY, DEFAULT_PORT};
+use ohttp_relay::{GatewayUri, OutboundTransportConfig, DEFAULT_GATEWAY, DEFAULT_PORT};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -26,18 +26,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port_env = std::env::var("PORT");
     let unix_socket_env = std::env::var("UNIX_SOCKET");
     let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
+    let outbound_transport = OutboundTransportConfig::from_env()?;
 
     match (port_env, unix_socket_env) {
         (Ok(_), Ok(_)) => panic!(
             "Both PORT and UNIX_SOCKET environment variables are set. Please specify only one."
         ),
         (Err(_), Ok(unix_socket_path)) =>
-            ohttp_relay::listen_socket(&unix_socket_path, gateway_origin).await?,
+            ohttp_relay::listen_socket_with_outbound_config(
+                &unix_socket_path,
+                gateway_origin,
+                outbound_transport,
+            )
+            .await?,
         (Ok(port_str), Err(_)) => {
             let port: u16 = port_str.parse().expect("Invalid PORT");
-            ohttp_relay::listen_tcp(port, gateway_origin).await?
+            ohttp_relay::listen_tcp_with_outbound_config(port, gateway_origin, outbound_transport)
+                .await?
         }
-        (Err(_), Err(_)) => ohttp_relay::listen_tcp(DEFAULT_PORT, gateway_origin).await?,
+        (Err(_), Err(_)) =>
+            ohttp_relay::listen_tcp_with_outbound_config(
+                DEFAULT_PORT,
+                gateway_origin,
+                outbound_transport,
+            )
+            .await?,
     }
     .await?
 }
