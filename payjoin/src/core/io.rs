@@ -7,37 +7,113 @@ use reqwest::{Client, Proxy};
 use crate::into_url::IntoUrl;
 use crate::OhttpKeys;
 
-/// Fetch the ohttp keys from the specified payjoin directory via proxy.
+const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Determines how OHTTP key bootstrapping is performed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyBootstrapMethod {
+    /// Fetch keys through an OHTTP relay using an HTTP proxy request.
+    #[default]
+    RelayConnect,
+    /// Fetch keys directly from the directory.
+    ///
+    /// A transport proxy (for example `socks5h://127.0.0.1:9050`) may be configured through
+    /// [`FetchOhttpKeysOptions::transport_proxy`] to avoid exposing direct network metadata.
+    Direct,
+}
+
+/// Optional settings for fetching OHTTP keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchOhttpKeysOptions {
+    /// How key bootstrapping should be performed.
+    pub key_bootstrap_method: KeyBootstrapMethod,
+    /// Request timeout for the key fetch request.
+    pub timeout: Duration,
+    /// Optional transport proxy used in [`KeyBootstrapMethod::Direct`] mode.
+    pub transport_proxy: Option<url::Url>,
+}
+
+impl FetchOhttpKeysOptions {
+    /// Create direct-bootstrap options with sensible defaults.
+    pub fn direct() -> Self {
+        Self {
+            key_bootstrap_method: KeyBootstrapMethod::Direct,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            transport_proxy: None,
+        }
+    }
+}
+
+impl Default for FetchOhttpKeysOptions {
+    fn default() -> Self {
+        Self {
+            key_bootstrap_method: KeyBootstrapMethod::RelayConnect,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            transport_proxy: None,
+        }
+    }
+}
+
+/// Fetch the ohttp keys from the specified payjoin directory via relay proxy.
 ///
 /// * `ohttp_relay`: The http CONNECT method proxy to request the ohttp keys from a payjoin
-///   directory.  Proxying requests for ohttp keys ensures a client IP address is never revealed to
+///   directory. Proxying requests for ohttp keys ensures a client IP address is never revealed to
 ///   the payjoin directory.
 ///
-/// * `payjoin_directory`: The payjoin directory from which to fetch the ohttp keys.  This
+/// * `payjoin_directory`: The payjoin directory from which to fetch the ohttp keys. This
 ///   directory stores and forwards payjoin client payloads.
 pub async fn fetch_ohttp_keys(
     ohttp_relay: impl IntoUrl,
     payjoin_directory: impl IntoUrl,
 ) -> Result<OhttpKeys, Error> {
-    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
-    let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
-    let client = Client::builder().proxy(proxy).http1_only().build()?;
-    let res = client
-        .get(ohttp_keys_url)
-        .timeout(Duration::from_secs(10))
-        .header(ACCEPT, "application/ohttp-keys")
-        .send()
-        .await?;
-    parse_ohttp_keys_response(res).await
+    fetch_ohttp_keys_with_options(Some(ohttp_relay), payjoin_directory, Default::default()).await
+}
+
+/// Fetch the ohttp keys from a payjoin directory using the provided options.
+///
+/// * `ohttp_relay`: Optional relay URL. Required for [`KeyBootstrapMethod::RelayConnect`].
+///
+/// * `payjoin_directory`: The payjoin directory from which to fetch the ohttp keys. This
+///   directory stores and forwards payjoin client payloads.
+///
+/// * `options`: Key bootstrap options. [`FetchOhttpKeysOptions::default`] preserves the
+///   pre-existing relay bootstrap behavior.
+pub async fn fetch_ohttp_keys_with_options(
+    ohttp_relay: Option<impl IntoUrl>,
+    payjoin_directory: impl IntoUrl,
+    options: FetchOhttpKeysOptions,
+) -> Result<OhttpKeys, Error> {
+    let mut builder = Client::builder().http1_only();
+
+    if options.transport_proxy.is_some()
+        && matches!(options.key_bootstrap_method, KeyBootstrapMethod::RelayConnect)
+    {
+        return Err(InternalErrorInner::ProxyChainingNotSupported.into());
+    }
+
+    if let Some(transport_proxy) = options.transport_proxy.as_ref() {
+        builder = builder.proxy(Proxy::all(transport_proxy.as_str())?);
+    }
+
+    let builder = match options.key_bootstrap_method {
+        KeyBootstrapMethod::RelayConnect => {
+            let relay = ohttp_relay.ok_or(InternalErrorInner::MissingRelay)?;
+            let proxy = Proxy::all(relay.into_url()?.as_str())?;
+            builder.proxy(proxy)
+        }
+        KeyBootstrapMethod::Direct => builder,
+    };
+
+    fetch_ohttp_keys_inner(builder, payjoin_directory, options.timeout).await
 }
 
 /// Fetch the ohttp keys from the specified payjoin directory via proxy.
 ///
 /// * `ohttp_relay`: The http CONNECT method proxy to request the ohttp keys from a payjoin
-///   directory.  Proxying requests for ohttp keys ensures a client IP address is never revealed to
+///   directory. Proxying requests for ohttp keys ensures a client IP address is never revealed to
 ///   the payjoin directory.
 ///
-/// * `payjoin_directory`: The payjoin directory from which to fetch the ohttp keys.  This
+/// * `payjoin_directory`: The payjoin directory from which to fetch the ohttp keys. This
 ///   directory stores and forwards payjoin client payloads.
 ///
 /// * `cert_der`: The DER-encoded certificate to use for local HTTPS connections.
@@ -47,17 +123,26 @@ pub async fn fetch_ohttp_keys_with_cert(
     payjoin_directory: impl IntoUrl,
     cert_der: Vec<u8>,
 ) -> Result<OhttpKeys, Error> {
-    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
     let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
-    let client = Client::builder()
+    let builder = Client::builder()
         .use_rustls_tls()
         .add_root_certificate(reqwest::tls::Certificate::from_der(&cert_der)?)
         .proxy(proxy)
-        .http1_only()
-        .build()?;
+        .http1_only();
+
+    fetch_ohttp_keys_inner(builder, payjoin_directory, DEFAULT_FETCH_TIMEOUT).await
+}
+
+async fn fetch_ohttp_keys_inner(
+    builder: reqwest::ClientBuilder,
+    payjoin_directory: impl IntoUrl,
+    timeout: Duration,
+) -> Result<OhttpKeys, Error> {
+    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
+    let client = builder.build()?;
     let res = client
         .get(ohttp_keys_url)
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
         .header(ACCEPT, "application/ohttp-keys")
         .send()
         .await?;
@@ -96,6 +181,8 @@ enum InternalErrorInner {
     #[cfg(feature = "_manual-tls")]
     Rustls(rustls::Error),
     InvalidOhttpKeys(String),
+    MissingRelay,
+    ProxyChainingNotSupported,
 }
 
 impl From<url::ParseError> for Error {
@@ -142,6 +229,10 @@ impl std::fmt::Display for InternalErrorInner {
             InvalidOhttpKeys(e) => {
                 write!(f, "Invalid ohttp keys returned from payjoin directory: {e}")
             }
+            MissingRelay => write!(f, "Relay bootstrap mode requires an ohttp relay URL"),
+            ProxyChainingNotSupported => {
+                write!(f, "Transport proxy with relay bootstrap mode is not supported")
+            }
             #[cfg(feature = "_manual-tls")]
             Rustls(e) => e.fmt(f),
         }
@@ -166,6 +257,8 @@ impl std::error::Error for InternalErrorInner {
             ParseUrl(e) => Some(e),
             Io(e) => Some(e),
             InvalidOhttpKeys(_) => None,
+            MissingRelay => None,
+            ProxyChainingNotSupported => None,
             #[cfg(feature = "_manual-tls")]
             Rustls(e) => Some(e),
         }
@@ -239,5 +332,77 @@ mod tests {
             ),
             "expected InvalidOhttpKeys error"
         );
+    }
+
+    #[test]
+    fn test_direct_options_helper() {
+        let options = FetchOhttpKeysOptions::direct();
+        assert_eq!(options.key_bootstrap_method, KeyBootstrapMethod::Direct);
+        assert_eq!(options.timeout, DEFAULT_FETCH_TIMEOUT);
+        assert!(options.transport_proxy.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_missing_relay_for_relay_bootstrap_mode() {
+        let err = fetch_ohttp_keys_with_options(
+            None::<&str>,
+            "https://example.com",
+            FetchOhttpKeysOptions::default(),
+        )
+        .await
+        .expect_err("relay bootstrap mode should require relay URL");
+
+        assert_eq!(err.to_string(), "Relay bootstrap mode requires an ohttp relay URL");
+    }
+
+    #[tokio::test]
+    async fn test_reject_transport_proxy_with_relay_bootstrap_mode() {
+        let options = FetchOhttpKeysOptions {
+            key_bootstrap_method: KeyBootstrapMethod::RelayConnect,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            transport_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("proxy URL should parse"),
+            ),
+        };
+
+        let err = fetch_ohttp_keys_with_options(
+            Some("https://relay.example"),
+            "https://directory.example",
+            options,
+        )
+        .await
+        .expect_err("proxy chaining is intentionally unsupported");
+
+        assert_eq!(err.to_string(), "Transport proxy with relay bootstrap mode is not supported");
+    }
+
+    #[tokio::test]
+    async fn test_direct_mode_does_not_require_relay_url() {
+        let err = fetch_ohttp_keys_with_options(
+            None::<&str>,
+            "not a valid url",
+            FetchOhttpKeysOptions::direct(),
+        )
+        .await
+        .expect_err("direct mode should not require a relay URL");
+
+        assert!(matches!(err, Error::Internal(InternalError(InternalErrorInner::ParseUrl(_)))));
+    }
+
+    #[tokio::test]
+    async fn test_direct_mode_rejects_invalid_transport_proxy_scheme() {
+        let options = FetchOhttpKeysOptions {
+            key_bootstrap_method: KeyBootstrapMethod::Direct,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            transport_proxy: Some(
+                url::Url::parse("ftp://127.0.0.1:21").expect("proxy URL should parse"),
+            ),
+        };
+
+        let err = fetch_ohttp_keys_with_options(None::<&str>, "https://directory.example", options)
+            .await
+            .expect_err("invalid transport proxy scheme should fail");
+
+        assert!(matches!(err, Error::Internal(InternalError(InternalErrorInner::Reqwest(_)))));
     }
 }
