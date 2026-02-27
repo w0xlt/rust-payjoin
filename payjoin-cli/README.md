@@ -79,8 +79,6 @@ pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
 # Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
 network_proxy = "socks5h://127.0.0.1:9050"
-# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
-bootstrap_mode = "auto"
 ```
 
 #### `receiver/config.toml`
@@ -98,8 +96,6 @@ pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
 # Optional Tor outbound proxy. Prefer socks5h to avoid local DNS leakage.
 network_proxy = "socks5h://127.0.0.1:9050"
-# Optional bootstrap mode: auto (default), relay_connect, or direct_tor.
-bootstrap_mode = "auto"
 ```
 
 Now, the receiver must generate an address to receive the payment. The format is:
@@ -143,8 +139,32 @@ Congratulations! You've completed a version 2 payjoin, which can be used for che
 Config options can be passed from the command line, or manually edited in a `config.toml` file within the directory you run `payjoin-cli` from.
 
 See the
-[example.config.toml](https://github.com/payjoin/rust-payjoin/blob/fde867b93ede767c9a50913432a73782a94ef40b/payjoin-cli/example.config.toml)
+[example.config.toml](./example.config.toml)
 for inspiration.
+
+### Tor Native BIP77 Configuration
+
+For onion-based BIP77 operation, set:
+
+```toml
+[v2]
+pj_directory = "http://directoryexampleabcdefghijklmnop.onion"
+ohttp_relays = ["http://relayexampleabcdefghijklmnop.onion"]
+network_proxy = "socks5h://127.0.0.1:9050"
+```
+
+Bootstrap behavior:
+
+- Onion `pj_directory` uses direct key bootstrap over `network_proxy`.
+- Non-onion `pj_directory` uses relay CONNECT/WebSocket key bootstrap.
+
+Operational notes:
+
+- Use `socks5h://` (not `socks5://`) to avoid local DNS leakage.
+  `socks5://` is rejected at startup.
+- Onion `pj_directory` without `network_proxy` fails loudly to avoid
+  accidental clearnet fallback.
+- Existing HTTPS deployment paths continue to work unchanged.
 
 ### Asynchronous Operation
 

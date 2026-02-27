@@ -8,6 +8,35 @@ Note that this binary is under active development and thus the CLI and configura
 
 payjoin-mailroom reads configuration from `config.toml` (or the path given with `--config`). Every setting can also be supplied via environment variables prefixed with `PJ_`, using double underscores for nesting (e.g., `PJ_TELEMETRY__ENDPOINT`).
 
+### Tor Native Relay Egress
+
+To route embedded relay egress (mailroom relay -> directory/gateway) through
+Tor, configure a SOCKS5h outbound proxy:
+
+```toml
+listener = "[::]:8080"
+storage_dir = "./data"
+timeout = 30
+
+[relay]
+outbound_proxy = "socks5h://127.0.0.1:9050"
+outbound_connect_timeout_secs = 10
+```
+
+Environment equivalents:
+
+```sh
+export PJ_RELAY__OUTBOUND_PROXY="socks5h://127.0.0.1:9050"
+export PJ_RELAY__OUTBOUND_CONNECT_TIMEOUT_SECS=10
+```
+
+Notes:
+
+- `relay.outbound_proxy` must use `socks5h://` so onion DNS is resolved by Tor.
+- `relay.outbound_connect_timeout_secs` is optional and must be greater than 0 when set.
+- payjoin-mailroom already shares a random sentinel tag between embedded relay
+  and directory on startup to detect and reject same-instance relay loops.
+
 ## Usage
 
 ### Cargo
