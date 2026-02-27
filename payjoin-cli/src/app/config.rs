@@ -181,7 +181,10 @@ impl Config {
                 #[cfg(feature = "v2")]
                 {
                     match built_config.get::<V2Config>("v2") {
-                        Ok(v2) => config.version = Some(VersionConfig::V2(v2)),
+                        Ok(v2) => {
+                            validate_v2_config(&v2)?;
+                            config.version = Some(VersionConfig::V2(v2));
+                        }
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V2 configuration is required for BIP77 mode: {e}"
@@ -278,6 +281,7 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     // Override config values with command line arguments if applicable
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let network_proxy = cli.network_proxy.as_ref().map(|s| s.as_str());
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
@@ -286,6 +290,7 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     config
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
+        .set_override_option("v2.network_proxy", network_proxy)?
         .set_override_option("v2.ohttp_relays", ohttp_relays)
 }
 
@@ -355,5 +360,100 @@ where
                 })
             })
             .map(Some),
+    }
+}
+
+#[cfg(feature = "v2")]
+fn validate_v2_config(v2: &V2Config) -> Result<(), ConfigError> {
+    if let Some(network_proxy) = v2.network_proxy.as_ref() {
+        validate_network_proxy_scheme(network_proxy)?;
+    }
+
+    if is_onion(&v2.pj_directory) && v2.network_proxy.is_none() {
+        return Err(ConfigError::Message(
+            "v2.pj_directory is an onion endpoint but v2.network_proxy is not configured. \
+             Refusing clearnet fallback; set v2.network_proxy to socks5h://127.0.0.1:9050"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "v2")]
+fn is_onion(url: &Url) -> bool {
+    url.domain().map(|domain| domain.to_ascii_lowercase().ends_with(".onion")).unwrap_or(false)
+}
+
+#[cfg(feature = "v2")]
+fn validate_network_proxy_scheme(proxy_url: &Url) -> Result<(), ConfigError> {
+    match proxy_url.scheme() {
+        "socks5h" => Ok(()),
+        "socks5" => Err(ConfigError::Message(
+            "v2.network_proxy uses socks5:// which leaks DNS queries locally. \
+             Use socks5h:// so the proxy resolves hostnames remotely"
+                .to_string(),
+        )),
+        "http" | "https" => Ok(()),
+        scheme => Err(ConfigError::Message(format!(
+            "Unsupported v2.network_proxy scheme '{scheme}'. Supported schemes: \
+             socks5h, http, https"
+        ))),
+    }
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_supported_network_proxy_schemes() {
+        for proxy in ["socks5h://127.0.0.1:9050", "http://127.0.0.1:8080", "https://127.0.0.1:8080"]
+        {
+            let proxy_url = Url::parse(proxy).unwrap();
+            assert!(validate_network_proxy_scheme(&proxy_url).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_socks5_without_remote_dns() {
+        let proxy_url = Url::parse("socks5://127.0.0.1:9050").unwrap();
+        let err = validate_network_proxy_scheme(&proxy_url).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("socks5h://"));
+    }
+
+    #[test]
+    fn rejects_unsupported_network_proxy_schemes() {
+        let proxy_url = Url::parse("ftp://127.0.0.1:21").unwrap();
+        let err = validate_network_proxy_scheme(&proxy_url).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Unsupported v2.network_proxy scheme"));
+    }
+
+    #[test]
+    fn onion_directory_requires_network_proxy() {
+        let v2 = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![Url::parse("https://relay.example").unwrap()],
+            pj_directory: Url::parse("http://directoryexample1234567890.onion").unwrap(),
+            network_proxy: None,
+        };
+
+        let err = validate_v2_config(&v2).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("v2.pj_directory is an onion endpoint"));
+    }
+
+    #[test]
+    fn non_onion_directory_allows_missing_proxy() {
+        let v2 = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![Url::parse("https://relay.example").unwrap()],
+            pj_directory: Url::parse("https://payjo.in").unwrap(),
+            network_proxy: None,
+        };
+
+        assert!(validate_v2_config(&v2).is_ok());
     }
 }

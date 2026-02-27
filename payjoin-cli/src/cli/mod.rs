@@ -76,6 +76,10 @@ pub struct Cli {
     #[arg(long = "pj-directory", help = "The directory to store payjoin requests", value_parser = value_parser!(Url))]
     pub pj_directory: Option<Url>,
 
+    #[cfg(feature = "v2")]
+    #[arg(long = "network-proxy", help = "Optional outbound proxy URL (for example socks5h://127.0.0.1:9050)", value_parser = value_parser!(Url))]
+    pub network_proxy: Option<Url>,
+
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
     pub root_certificate: Option<PathBuf>,
