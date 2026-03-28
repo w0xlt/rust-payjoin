@@ -48,9 +48,15 @@ rpcpassword = "password"
 
 # Version 2 Configuration
 # [v2]
+# transport = "relay"
 # pj_directory = "https://payjo.in"
 # ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com", "https://example.com"]
 # # Optional: The HPKE keys which need to be fetched ahead of time from the pj_endpoint
 # # for the payjoin packets to be encrypted.
 # # These can now be fetched and no longer need to be configured.
 # ohttp_keys = "./path/to/ohttp_keys"
+#
+# # Direct Tor/onion mode
+# # transport = "direct"
+# # pj_directory = "http://exampleonionaddress.onion"
+# # socks_proxy = "socks5h://127.0.0.1:9050"
