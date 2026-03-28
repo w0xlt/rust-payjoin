@@ -19,9 +19,17 @@ pub async fn fetch_ohttp_keys(
     ohttp_relay: impl IntoUrl,
     payjoin_directory: impl IntoUrl,
 ) -> Result<OhttpKeys, Error> {
-    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
     let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
     let client = Client::builder().proxy(proxy).http1_only().build()?;
+    fetch_ohttp_keys_with_client(&client, payjoin_directory).await
+}
+
+/// Fetch the OHTTP keys directly from the specified payjoin directory using the provided client.
+pub async fn fetch_ohttp_keys_with_client(
+    client: &Client,
+    payjoin_directory: impl IntoUrl,
+) -> Result<OhttpKeys, Error> {
+    let ohttp_keys_url = ohttp_keys_url(payjoin_directory)?;
     let res = client
         .get(ohttp_keys_url)
         .timeout(Duration::from_secs(10))
@@ -29,6 +37,12 @@ pub async fn fetch_ohttp_keys(
         .send()
         .await?;
     parse_ohttp_keys_response(res).await
+}
+
+/// Fetch the OHTTP keys directly from the specified payjoin directory.
+pub async fn fetch_ohttp_keys_direct(payjoin_directory: impl IntoUrl) -> Result<OhttpKeys, Error> {
+    let client = Client::builder().http1_only().build()?;
+    fetch_ohttp_keys_with_client(&client, payjoin_directory).await
 }
 
 /// Fetch the ohttp keys from the specified payjoin directory via proxy.
@@ -47,7 +61,6 @@ pub async fn fetch_ohttp_keys_with_cert(
     payjoin_directory: impl IntoUrl,
     cert_der: &[u8],
 ) -> Result<OhttpKeys, Error> {
-    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
     let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
     let client = Client::builder()
         .use_rustls_tls()
@@ -55,13 +68,22 @@ pub async fn fetch_ohttp_keys_with_cert(
         .proxy(proxy)
         .http1_only()
         .build()?;
-    let res = client
-        .get(ohttp_keys_url)
-        .timeout(Duration::from_secs(10))
-        .header(ACCEPT, "application/ohttp-keys")
-        .send()
-        .await?;
-    parse_ohttp_keys_response(res).await
+    fetch_ohttp_keys_with_client(&client, payjoin_directory).await
+}
+
+/// Fetch the OHTTP keys directly from the specified payjoin directory using a custom root
+/// certificate. This is primarily useful for local HTTPS-based test deployments.
+#[cfg(feature = "_manual-tls")]
+pub async fn fetch_ohttp_keys_direct_with_cert(
+    payjoin_directory: impl IntoUrl,
+    cert_der: &[u8],
+) -> Result<OhttpKeys, Error> {
+    let client = Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(reqwest::tls::Certificate::from_der(cert_der)?)
+        .http1_only()
+        .build()?;
+    fetch_ohttp_keys_with_client(&client, payjoin_directory).await
 }
 
 async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, Error> {
@@ -73,6 +95,10 @@ async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, 
     OhttpKeys::decode(&body).map_err(|e| {
         Error::Internal(InternalError(InternalErrorInner::InvalidOhttpKeys(e.to_string())))
     })
+}
+
+fn ohttp_keys_url(payjoin_directory: impl IntoUrl) -> Result<url::Url, Error> {
+    Ok(payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?)
 }
 
 #[derive(Debug)]
