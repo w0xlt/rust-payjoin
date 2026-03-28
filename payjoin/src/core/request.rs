@@ -5,6 +5,34 @@ const V1_REQ_CONTENT_TYPE: &str = "text/plain";
 #[cfg(feature = "v2")]
 const V2_REQ_CONTENT_TYPE: &str = "message/ohttp-req";
 
+#[cfg(feature = "v2")]
+const RFC_9540_GATEWAY_PATH: &str = "/.well-known/ohttp-gateway";
+
+#[cfg(feature = "v2")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OhttpTransport {
+    Relay(Url),
+    Direct(Url),
+}
+
+#[cfg(feature = "v2")]
+impl OhttpTransport {
+    pub fn relay(url: impl crate::IntoUrl) -> Result<Self, crate::IntoUrlError> {
+        Ok(Self::Relay(url.into_url()?))
+    }
+
+    pub fn direct(url: impl crate::IntoUrl) -> Result<Self, crate::IntoUrlError> {
+        Ok(Self::Direct(url.into_url()?))
+    }
+
+    pub(crate) fn request_url(&self, directory_base: &Url) -> Result<Url, url::ParseError> {
+        match self {
+            Self::Relay(relay_base) => relay_base.join(&format!("/{directory_base}")),
+            Self::Direct(directory) => directory.join(RFC_9540_GATEWAY_PATH),
+        }
+    }
+}
+
 /// Represents data that needs to be transmitted to the receiver or payjoin directory.
 /// Ensure the `Content-Length` is set to the length of `body`. (most libraries do this automatically)
 #[non_exhaustive]

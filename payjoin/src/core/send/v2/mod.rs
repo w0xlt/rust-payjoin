@@ -50,7 +50,7 @@ use crate::persist::{
 };
 use crate::uri::v2::PjParam;
 use crate::uri::ShortId;
-use crate::{HpkeKeyPair, IntoUrl, PjUri, Request};
+use crate::{HpkeKeyPair, IntoUrl, OhttpTransport, PjUri, Request};
 
 mod error;
 mod session;
@@ -210,19 +210,14 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, InternalCreateRequestError> {
-        let relay_base = ohttp_relay.into_url().map_err(InternalCreateRequestError::Url)?;
-
-        // Only reveal scheme and authority to the relay
+    fn request_url(&self, transport: &OhttpTransport) -> Result<Url, InternalCreateRequestError> {
         let directory_base = self
             .pj_param
             .endpoint()
             .join("/")
             .map_err(|e| InternalCreateRequestError::Url(e.into()))?;
-
-        // Append that information as a path to the relay URL
-        relay_base
-            .join(&format!("/{directory_base}"))
+        transport
+            .request_url(&directory_base)
             .map_err(|e| InternalCreateRequestError::Url(e.into()))
     }
 }
@@ -309,6 +304,17 @@ impl Sender<WithReplyKey> {
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ClientResponse), CreateRequestError> {
+        let transport =
+            OhttpTransport::relay(ohttp_relay).map_err(InternalCreateRequestError::Url)?;
+        self.create_v2_post_request_with_transport(transport)
+    }
+
+    /// Construct an OHTTP-encapsulated HTTP POST request for the Original PSBT using either a
+    /// relay target or the directory directly.
+    pub fn create_v2_post_request_with_transport(
+        &self,
+        transport: OhttpTransport,
+    ) -> Result<(Request, ClientResponse), CreateRequestError> {
         if self.session_context.pj_param.expiration().elapsed() {
             return Err(InternalCreateRequestError::Expired(
                 self.session_context.pj_param.expiration(),
@@ -324,7 +330,7 @@ impl Sender<WithReplyKey> {
             self.session_context.psbt_ctx.fee_contribution,
             self.session_context.psbt_ctx.min_fee_rate,
         )?;
-        let (request, ohttp_ctx) = extract_request(&self.session_context, ohttp_relay, body)?;
+        let (request, ohttp_ctx) = extract_request(&self.session_context, &transport, body)?;
         Ok((request, ohttp_ctx))
     }
 
@@ -372,7 +378,7 @@ impl Sender<WithReplyKey> {
 
 pub(crate) fn extract_request(
     session_context: &SessionContext,
-    ohttp_relay: impl IntoUrl,
+    transport: &OhttpTransport,
     body: Vec<u8>,
 ) -> Result<(Request, ClientResponse), CreateRequestError> {
     let body = encrypt_message_a(
@@ -389,9 +395,9 @@ pub(crate) fn extract_request(
         Some(&body),
     )
     .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
-    let full_relay_url = session_context.full_relay_url(ohttp_relay)?;
-    tracing::debug!("ohttp_relay_url: {full_relay_url:?}");
-    let request = Request::new_v2(&full_relay_url, &body);
+    let request_url = session_context.request_url(transport)?;
+    tracing::debug!("v2_request_url: {request_url:?}");
+    let request = Request::new_v2(&request_url, &body);
     Ok((request, ohttp_ctx))
 }
 
@@ -432,6 +438,17 @@ impl Sender<PollingForProposal> {
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), CreateRequestError> {
+        let transport =
+            OhttpTransport::relay(ohttp_relay).map_err(InternalCreateRequestError::Url)?;
+        self.create_poll_request_with_transport(transport)
+    }
+
+    /// Construct an OHTTP-encapsulated HTTP GET request for polling the receiver mailbox using
+    /// either a relay target or the directory directly.
+    pub fn create_poll_request_with_transport(
+        &self,
+        transport: OhttpTransport,
+    ) -> Result<(Request, ohttp::ClientResponse), CreateRequestError> {
         // TODO unify with receiver's fn short_id_from_pubkey
         let hash = sha256::Hash::hash(
             &HpkeKeyPair::from_secret_key(&self.session_context.reply_key)
@@ -453,7 +470,7 @@ impl Sender<PollingForProposal> {
         let (body, ohttp_ctx) = ohttp_encapsulate(ohttp_keys, "GET", url.as_str(), Some(&body))
             .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
 
-        Ok((Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body), ohttp_ctx))
+        Ok((Request::new_v2(&self.session_context.request_url(&transport)?, &body), ohttp_ctx))
     }
 
     /// Processes the response for the final GET message from the sender client
@@ -611,6 +628,18 @@ mod test {
             request.url.to_string(),
             format!("{}/{}", EXAMPLE_URL, sender.session_context.pj_param.endpoint().join("/")?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_v2_success_direct_transport() -> Result<(), BoxError> {
+        let expiration =
+            Time::from_now(Duration::from_secs(60)).expect("expiration should be valid");
+        let sender = create_sender_context(expiration)?;
+        let transport = OhttpTransport::direct(EXAMPLE_URL)?;
+        let (request, _) = sender.create_v2_post_request_with_transport(transport)?;
+        assert!(!request.body.is_empty(), "Request body should not be empty");
+        assert_eq!(request.url, format!("{EXAMPLE_URL}/.well-known/ohttp-gateway"));
         Ok(())
     }
 
