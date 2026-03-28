@@ -60,7 +60,7 @@ use crate::persist::{
 use crate::receive::{parse_payload, InputPair, OriginalPayload, PsbtContext};
 use crate::time::Time;
 use crate::uri::ShortId;
-use crate::{ImplementationError, IntoUrl, IntoUrlError, Request, Version};
+use crate::{ImplementationError, IntoUrl, IntoUrlError, OhttpTransport, Request, Version};
 
 mod error;
 mod session;
@@ -83,17 +83,10 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, InternalSessionError> {
-        let relay_base = ohttp_relay.into_url().map_err(InternalSessionError::ParseUrl)?;
-
-        // Only reveal scheme and authority to the relay
+    fn request_url(&self, transport: &OhttpTransport) -> Result<Url, InternalSessionError> {
         let directory_base =
             self.directory.join("/").map_err(|e| InternalSessionError::ParseUrl(e.into()))?;
-
-        // Append that information as a path to the relay URL
-        relay_base
-            .join(&format!("/{directory_base}"))
-            .map_err(|e| InternalSessionError::ParseUrl(e.into()))
+        transport.request_url(&directory_base).map_err(|e| InternalSessionError::ParseUrl(e.into()))
     }
 
     /// The mailbox ID where the receiver expects the sender's Original PSBT.
@@ -362,12 +355,23 @@ impl Receiver<Initialized> {
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), Error> {
+        let transport =
+            OhttpTransport::relay(ohttp_relay).map_err(InternalSessionError::ParseUrl)?;
+        self.create_poll_request_with_transport(transport)
+    }
+
+    /// Create an OHTTP encapsulated HTTP GET request to poll for the Original PSBT using either a
+    /// relay target or the directory directly.
+    pub fn create_poll_request_with_transport(
+        &self,
+        transport: OhttpTransport,
+    ) -> Result<(Request, ohttp::ClientResponse), Error> {
         if self.session_context.expiration.elapsed() {
             return Err(InternalSessionError::Expired(self.session_context.expiration).into());
         }
         let (body, ohttp_ctx) =
             self.fallback_req_body().map_err(InternalSessionError::OhttpEncapsulation)?;
-        let req = Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(&self.session_context.request_url(&transport)?, &body);
         Ok((req, ohttp_ctx))
     }
 
@@ -1093,6 +1097,17 @@ impl Receiver<PayjoinProposal> {
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), Error> {
+        let transport =
+            OhttpTransport::relay(ohttp_relay).map_err(InternalSessionError::ParseUrl)?;
+        self.create_post_request_with_transport(transport)
+    }
+
+    /// Construct an OHTTP Encapsulated HTTP POST request for the Proposal PSBT using either a
+    /// relay target or the directory directly.
+    pub fn create_post_request_with_transport(
+        &self,
+        transport: OhttpTransport,
+    ) -> Result<(Request, ohttp::ClientResponse), Error> {
         let target_resource: Url;
         let body: Vec<u8>;
         let method: &str;
@@ -1120,7 +1135,7 @@ impl Receiver<PayjoinProposal> {
             Some(&body),
         )?;
 
-        let req = Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(&self.session_context.request_url(&transport)?, &body);
         Ok((req, ctx))
     }
 
@@ -1178,6 +1193,17 @@ impl Receiver<HasReplyableError> {
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), SessionError> {
+        let transport =
+            OhttpTransport::relay(ohttp_relay).map_err(InternalSessionError::ParseUrl)?;
+        self.create_error_request_with_transport(transport)
+    }
+
+    /// Construct an OHTTP Encapsulated HTTP POST request to return a receiver error response
+    /// using either a relay target or the directory directly.
+    pub fn create_error_request_with_transport(
+        &self,
+        transport: OhttpTransport,
+    ) -> Result<(Request, ohttp::ClientResponse), SessionError> {
         let session_context = &self.session_context;
         if session_context.expiration.elapsed() {
             return Err(InternalSessionError::Expired(session_context.expiration).into());
@@ -1202,7 +1228,7 @@ impl Receiver<HasReplyableError> {
         let (body, ohttp_ctx) =
             ohttp_encapsulate(&session_context.ohttp_keys.0, "POST", mailbox.as_str(), Some(&body))
                 .map_err(InternalSessionError::OhttpEncapsulation)?;
-        let req = Request::new_v2(&session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(&session_context.request_url(&transport)?, &body);
         Ok((req, ohttp_ctx))
     }
 
@@ -1706,6 +1732,19 @@ pub mod test {
 
         let (_req, _ctx) = receiver.create_error_request(EXAMPLE_URL)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_error_request_direct_transport() -> Result<(), BoxError> {
+        let receiver = Receiver {
+            state: HasReplyableError { error_reply: mock_err() },
+            session_context: SHARED_CONTEXT.clone(),
+        };
+
+        let (req, _ctx) =
+            receiver.create_error_request_with_transport(OhttpTransport::direct(EXAMPLE_URL)?)?;
+        assert_eq!(req.url, format!("{EXAMPLE_URL}/.well-known/ohttp-gateway"));
         Ok(())
     }
 
