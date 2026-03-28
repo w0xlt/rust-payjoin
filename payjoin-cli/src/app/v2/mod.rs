@@ -544,12 +544,12 @@ impl App {
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
-        let ohttp_relay =
-            self.unwrap_relay_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
+        let transport =
+            self.resolve_transport_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
 
         let mut session = session;
         loop {
-            let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
+            let (req, context) = session.create_poll_request_with_transport(transport.clone())?;
             println!("Polling receive request...");
             let ohttp_response = self.post_request(req).await?;
             let state_transition = session
@@ -746,8 +746,9 @@ impl App {
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
+        let transport = self.resolve_transport_or_else_fetch(None::<&str>).await?;
         let (req, ohttp_ctx) = proposal
-            .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
+            .create_post_request_with_transport(transport)
             .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
         let res = self.post_request(req).await?;
         let payjoin_psbt = proposal.psbt().clone();
@@ -818,10 +819,18 @@ impl App {
             self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
         let ohttp_relay = match selected_relay {
             Some(relay) => relay,
-            None =>
-                unwrap_ohttp_keys_or_else_fetch(&self.config, directory, self.relay_manager.clone())
-                    .await?
-                    .relay_url,
+            None => match unwrap_ohttp_keys_or_else_fetch(
+                &self.config,
+                directory,
+                self.relay_manager.clone(),
+            )
+            .await?
+            .transport
+            {
+                payjoin::OhttpTransport::Relay(relay) => relay,
+                payjoin::OhttpTransport::Direct(_) =>
+                    return Err(anyhow!("Direct transport selected where relay was required")),
+            },
         };
         Ok(ohttp_relay)
     }
@@ -852,8 +861,8 @@ impl App {
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (err_req, err_ctx) = session
-            .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
+        let transport = self.resolve_transport_or_else_fetch(None::<&str>).await?;
+        let (err_req, err_ctx) = session.create_error_request_with_transport(transport)?;
 
         let err_response = match self.post_request(err_req).await {
             Ok(response) => response,
