@@ -6,6 +6,9 @@ use payjoin::bitcoin::{Amount, FeeRate};
 use serde::Deserialize;
 use url::Url;
 
+#[cfg(feature = "v2")]
+use crate::app::config::V2Transport;
+
 #[derive(Debug, Clone, Deserialize, Parser)]
 pub struct Flags {
     #[arg(long = "bip77", help = "Use BIP77 (v2) protocol (default)", action = clap::ArgAction::SetTrue)]
@@ -65,6 +68,10 @@ pub struct Cli {
     pub pj_endpoint: Option<Url>,
 
     #[cfg(feature = "v2")]
+    #[arg(long = "v2-transport", help = "The BIP77 transport mode: relay or direct", value_enum)]
+    pub v2_transport: Option<V2Transport>,
+
+    #[cfg(feature = "v2")]
     #[arg(long = "ohttp-relays", help = "One or more ohttp relay URLs, comma-separated", value_parser = value_parser!(Url), value_delimiter = ',', action = clap::ArgAction::Append)]
     pub ohttp_relays: Option<Vec<Url>>,
 
@@ -75,6 +82,10 @@ pub struct Cli {
     #[cfg(feature = "v2")]
     #[arg(long = "pj-directory", help = "The directory to store payjoin requests", value_parser = value_parser!(Url))]
     pub pj_directory: Option<Url>,
+
+    #[cfg(feature = "v2")]
+    #[arg(long = "socks-proxy", help = "SOCKS5h proxy URL for direct BIP77 mode", value_parser = value_parser!(Url))]
+    pub socks_proxy: Option<Url>,
 
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]

@@ -15,6 +15,25 @@ const CONFIG_DIR: &str = "payjoin-cli";
 
 type Builder = config::builder::ConfigBuilder<DefaultState>;
 
+#[cfg(feature = "v2")]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum V2Transport {
+    #[default]
+    Relay,
+    Direct,
+}
+
+#[cfg(feature = "v2")]
+impl V2Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BitcoindConfig {
     pub rpchost: Url,
@@ -33,10 +52,41 @@ pub struct V1Config {
 #[cfg(feature = "v2")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct V2Config {
+    #[serde(default)]
+    pub transport: V2Transport,
     #[serde(deserialize_with = "deserialize_ohttp_keys_from_path")]
     pub ohttp_keys: Option<payjoin::OhttpKeys>,
+    #[serde(default)]
     pub ohttp_relays: Vec<Url>,
     pub pj_directory: Url,
+    pub socks_proxy: Option<Url>,
+}
+
+#[cfg(feature = "v2")]
+impl V2Config {
+    fn validate(self) -> Result<Self, ConfigError> {
+        match self.transport {
+            V2Transport::Relay =>
+                if self.ohttp_relays.is_empty() {
+                    return Err(ConfigError::Message(
+                        "BIP77 relay mode requires at least one OHTTP relay URL".to_owned(),
+                    ));
+                },
+            V2Transport::Direct => {
+                let Some(socks_proxy) = self.socks_proxy.as_ref() else {
+                    return Err(ConfigError::Message(
+                        "BIP77 direct mode requires a SOCKS proxy URL".to_owned(),
+                    ));
+                };
+                if socks_proxy.scheme() != "socks5h" {
+                    return Err(ConfigError::Message(
+                        "BIP77 direct mode requires a socks5h:// SOCKS proxy URL".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(self)
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -180,7 +230,7 @@ impl Config {
                 #[cfg(feature = "v2")]
                 {
                     match built_config.get::<V2Config>("v2") {
-                        Ok(v2) => config.version = Some(VersionConfig::V2(v2)),
+                        Ok(v2) => config.version = Some(VersionConfig::V2(v2.validate()?)),
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V2 configuration is required for BIP77 mode: {e}"
@@ -270,21 +320,28 @@ fn add_v1_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
 fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     // Set default values
     let config = config
+        .set_default("v2.transport", V2Transport::Relay.as_str())?
         .set_default("v2.pj_directory", "https://payjo.in")?
-        .set_default("v2.ohttp_keys", None::<String>)?;
+        .set_default("v2.ohttp_keys", None::<String>)?
+        .set_default("v2.ohttp_relays", Vec::<String>::new())?
+        .set_default("v2.socks_proxy", None::<String>)?;
 
     // Override config values with command line arguments if applicable
+    let transport = cli.v2_transport.map(V2Transport::as_str);
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
         .map(|urls| urls.iter().map(|url| url.as_str()).collect::<Vec<_>>());
+    let socks_proxy = cli.socks_proxy.as_ref().map(|url| url.as_str());
 
     config
+        .set_override_option("v2.transport", transport)?
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
-        .set_override_option("v2.ohttp_relays", ohttp_relays)
+        .set_override_option("v2.ohttp_relays", ohttp_relays)?
+        .set_override_option("v2.socks_proxy", socks_proxy)
 }
 
 /// Handles configuration overrides based on CLI subcommands
@@ -331,6 +388,52 @@ fn handle_subcommands(config: Builder, cli: &Cli) -> Result<Builder, ConfigError
         Commands::Resume => Ok(config),
         #[cfg(feature = "v2")]
         Commands::History => Ok(config),
+    }
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use url::Url;
+
+    use super::{V2Config, V2Transport};
+
+    fn v2_config(transport: V2Transport) -> V2Config {
+        V2Config {
+            transport,
+            ohttp_keys: None,
+            ohttp_relays: Vec::new(),
+            pj_directory: Url::parse("https://payjo.in").expect("static URL is valid"),
+            socks_proxy: None,
+        }
+    }
+
+    #[test]
+    fn relay_mode_requires_relays() {
+        let err = v2_config(V2Transport::Relay).validate().expect_err("relay mode should fail");
+        assert!(err.to_string().contains("requires at least one OHTTP relay URL"));
+    }
+
+    #[test]
+    fn direct_mode_requires_socks_proxy() {
+        let err = v2_config(V2Transport::Direct).validate().expect_err("direct mode should fail");
+        assert!(err.to_string().contains("requires a SOCKS proxy URL"));
+    }
+
+    #[test]
+    fn direct_mode_requires_socks5h() {
+        let mut config = v2_config(V2Transport::Direct);
+        config.socks_proxy =
+            Some(Url::parse("socks5://127.0.0.1:9050").expect("static URL is valid"));
+        let err = config.validate().expect_err("socks5 should be rejected");
+        assert!(err.to_string().contains("requires a socks5h:// SOCKS proxy URL"));
+    }
+
+    #[test]
+    fn direct_mode_accepts_socks5h_without_relays() {
+        let mut config = v2_config(V2Transport::Direct);
+        config.socks_proxy =
+            Some(Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"));
+        config.validate().expect("socks5h direct mode should validate");
     }
 }
 
