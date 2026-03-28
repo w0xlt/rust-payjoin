@@ -11,7 +11,7 @@ pub mod config;
 pub mod wallet;
 use crate::app::config::Config;
 #[cfg(feature = "v2")]
-use crate::app::config::V2Transport;
+use crate::app::config::SessionTransport;
 use crate::app::wallet::BitcoindWallet;
 
 #[cfg(feature = "v1")]
@@ -94,24 +94,22 @@ fn http_agent_builder() -> Result<reqwest::ClientBuilder> {
 
 #[cfg(feature = "v2")]
 #[allow(dead_code)]
-pub(crate) fn v2_http_agent(config: &Config) -> Result<reqwest::Client> {
-    match config.v2()?.transport {
-        V2Transport::Relay => http_agent(config),
-        V2Transport::Direct => direct_http_agent(config),
+pub(crate) fn v2_http_agent(
+    config: &Config,
+    session_transport: &SessionTransport,
+) -> Result<reqwest::Client> {
+    match session_transport {
+        SessionTransport::Relay { .. } => http_agent(config),
+        SessionTransport::Direct { socks_proxy } => direct_http_agent(config, socks_proxy),
     }
 }
 
 #[cfg(feature = "v2")]
 #[allow(dead_code)]
-fn direct_http_agent(config: &Config) -> Result<reqwest::Client> {
-    let socks_proxy = config
-        .v2()?
-        .socks_proxy
-        .as_ref()
-        .expect("direct transport validation should guarantee a SOCKS proxy");
+fn direct_http_agent(_config: &Config, socks_proxy: &Url) -> Result<reqwest::Client> {
     let proxy = reqwest::Proxy::all(isolated_socks_proxy_url(socks_proxy)?.as_str())?;
     #[cfg(feature = "_manual-tls")]
-    let builder = http_agent_builder(config.root_certificate.as_ref())?;
+    let builder = http_agent_builder(_config.root_certificate.as_ref())?;
     #[cfg(not(feature = "_manual-tls"))]
     let builder = http_agent_builder()?;
     Ok(builder.proxy(proxy).build()?)
@@ -121,6 +119,10 @@ fn direct_http_agent(config: &Config) -> Result<reqwest::Client> {
 #[allow(dead_code)]
 fn isolated_socks_proxy_url(socks_proxy: &Url) -> Result<Url> {
     use payjoin::bitcoin::key::rand::Rng;
+
+    if !socks_proxy.username().is_empty() || socks_proxy.password().is_some() {
+        return Ok(socks_proxy.clone());
+    }
 
     let mut proxy = socks_proxy.clone();
     let mut rng = payjoin::bitcoin::key::rand::thread_rng();
@@ -162,5 +164,14 @@ mod tests {
 
         assert_ne!(first.username(), second.username());
         assert_ne!(first.password(), second.password());
+    }
+
+    #[test]
+    fn isolated_socks_proxy_url_preserves_explicit_credentials() {
+        let base =
+            url::Url::parse("socks5h://user:pass@127.0.0.1:9050").expect("static URL is valid");
+        let isolated = isolated_socks_proxy_url(&base).expect("isolation should succeed");
+
+        assert_eq!(isolated, base);
     }
 }

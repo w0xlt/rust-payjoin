@@ -19,9 +19,11 @@ use payjoin::send::v2::{
 use payjoin::{ImplementationError, PjParam, Uri};
 use tokio::sync::watch;
 
-use super::config::{Config, V2Transport};
+use super::config::{Config, SessionTransport, V2Transport};
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
+#[cfg(feature = "v1")]
+use crate::app::http_agent;
 use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
 use crate::app::{handle_interrupt, v2_http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
@@ -196,7 +198,8 @@ impl AppTrait for App {
                     "Sent fallback transaction hex: {:#}",
                     payjoin::bitcoin::consensus::encode::serialize_hex(&fallback_tx)
                 );
-                let psbt = ctx.process_response(&response.bytes().await?).map_err(|e| {
+                let response_bytes = response.bytes().await?;
+                let psbt = ctx.process_response(&response_bytes).map_err(|e| {
                     tracing::debug!("Error processing response: {e:?}");
                     anyhow!("Failed to process response {e}")
                 })?;
@@ -254,17 +257,17 @@ impl AppTrait for App {
 
     async fn receive_payjoin(&self, amount: Amount) -> Result<()> {
         let address = self.wallet().get_new_address()?;
-        let ohttp_keys =
-            unwrap_ohttp_keys_or_else_fetch(&self.config, None, self.relay_manager.clone())
-                .await?
-                .ohttp_keys;
+        let validated_transport =
+            unwrap_ohttp_keys_or_else_fetch(&self.config, None, self.relay_manager.clone()).await?;
         let persister = ReceiverPersister::new(self.db.clone())?;
+        let ohttp_keys = validated_transport.ohttp_keys;
         let session =
             ReceiverBuilder::new(address, self.config.v2()?.pj_directory.as_str(), ohttp_keys)?
                 .with_amount(amount)
                 .with_max_fee_rate(self.config.max_fee_rate.unwrap_or(FeeRate::BROADCAST_MIN))
                 .build()
                 .save(&persister)?;
+        persister.set_transport(&validated_transport.transport)?;
 
         println!("Receive session established");
         let pj_uri = session.pj_uri();
@@ -499,9 +502,10 @@ impl App {
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let transport = self.resolve_transport_or_else_fetch(Some(&sender.endpoint())).await?;
+        let (session_transport, transport) =
+            self.resolve_sender_transport_or_else_fetch(&sender, persister).await?;
         let (req, ctx) = sender.create_v2_post_request_with_transport(transport)?;
-        let response = self.post_request(req).await?;
+        let response = self.post_request(&session_transport, req).await?;
         println!("Posted original proposal...");
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
         self.get_proposed_payjoin_psbt(sender, persister).await
@@ -512,12 +516,13 @@ impl App {
         sender: Sender<PollingForProposal>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let transport = self.resolve_transport_or_else_fetch(Some(&sender.endpoint())).await?;
+        let (session_transport, transport) =
+            self.resolve_sender_transport_or_else_fetch(&sender, persister).await?;
         let mut session = sender.clone();
         // Long poll until we get a response
         loop {
             let (req, ctx) = session.create_poll_request_with_transport(transport.clone())?;
-            let response = self.post_request(req).await?;
+            let response = self.post_request(&session_transport, req).await?;
             let res = session.process_response(&response.bytes().await?, ctx).save(persister);
             match res {
                 Ok(OptionalTransitionOutcome::Progress(psbt)) => {
@@ -544,14 +549,14 @@ impl App {
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
-        let ohttp_relay =
-            self.unwrap_relay_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
+        let (session_transport, transport) =
+            self.resolve_receiver_transport_or_else_fetch(&session, persister).await?;
 
         let mut session = session;
         loop {
-            let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
+            let (req, context) = session.create_poll_request_with_transport(transport.clone())?;
             println!("Polling receive request...");
-            let ohttp_response = self.post_request(req).await?;
+            let ohttp_response = self.post_request(&session_transport, req).await?;
             let state_transition = session
                 .process_response(ohttp_response.bytes().await?.to_vec().as_slice(), context)
                 .save(persister);
@@ -746,10 +751,12 @@ impl App {
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
+        let (session_transport, transport) =
+            self.resolve_receiver_transport_or_else_fetch(&proposal, persister).await?;
         let (req, ohttp_ctx) = proposal
-            .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
+            .create_post_request_with_transport(transport)
             .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
-        let res = self.post_request(req).await?;
+        let res = self.post_request(&session_transport, req).await?;
         let payjoin_psbt = proposal.psbt().clone();
         let session = proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
         println!(
@@ -818,32 +825,89 @@ impl App {
             self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
         let ohttp_relay = match selected_relay {
             Some(relay) => relay,
-            None =>
-                unwrap_ohttp_keys_or_else_fetch(&self.config, directory, self.relay_manager.clone())
-                    .await?
-                    .relay_url,
+            None => match unwrap_ohttp_keys_or_else_fetch(
+                &self.config,
+                directory,
+                self.relay_manager.clone(),
+            )
+            .await?
+            .transport
+            {
+                SessionTransport::Relay { relay } => relay,
+                SessionTransport::Direct { .. } =>
+                    return Err(anyhow!("Direct transport selected where relay was required")),
+            },
         };
         Ok(ohttp_relay)
     }
 
-    async fn resolve_transport_or_else_fetch(
+    async fn resolve_session_transport_or_else_fetch(
         &self,
+        persisted_transport: Option<SessionTransport>,
         directory: Option<impl payjoin::IntoUrl>,
-    ) -> Result<payjoin::OhttpTransport> {
+    ) -> Result<SessionTransport> {
+        if let Some(transport) = persisted_transport {
+            return Ok(transport);
+        }
+
         let directory = directory.map(|url| url.into_url()).transpose()?;
         match self.config.v2()?.transport {
             V2Transport::Relay => {
                 let relay = self
                     .unwrap_relay_or_else_fetch(directory.as_ref().map(url::Url::as_str))
                     .await?;
-                Ok(payjoin::OhttpTransport::Relay(relay))
+                Ok(SessionTransport::relay(relay))
             }
             V2Transport::Direct => {
-                let directory = directory.unwrap_or(self.config.v2()?.pj_directory.clone());
-                let directory = directory.join("/")?;
-                Ok(payjoin::OhttpTransport::Direct(directory))
+                let socks_proxy = self
+                    .config
+                    .v2()?
+                    .socks_proxy
+                    .clone()
+                    .expect("direct transport validation should guarantee a SOCKS proxy");
+                Ok(SessionTransport::direct(socks_proxy))
             }
         }
+    }
+
+    async fn resolve_sender_transport_or_else_fetch<State>(
+        &self,
+        session: &Sender<State>,
+        persister: &SenderPersister,
+    ) -> Result<(SessionTransport, payjoin::OhttpTransport)> {
+        let endpoint = url::Url::parse(&session.endpoint())?;
+        let persisted_transport = persister.transport()?;
+        let session_transport = self
+            .resolve_session_transport_or_else_fetch(
+                persisted_transport.clone(),
+                Some(endpoint.as_str()),
+            )
+            .await?;
+        if persisted_transport.is_none() {
+            persister.set_transport(&session_transport)?;
+        }
+
+        Ok((session_transport.clone(), session_transport.as_ohttp_transport(&endpoint)?))
+    }
+
+    async fn resolve_receiver_transport_or_else_fetch<State>(
+        &self,
+        session: &Receiver<State>,
+        persister: &ReceiverPersister,
+    ) -> Result<(SessionTransport, payjoin::OhttpTransport)> {
+        let endpoint = url::Url::parse(session.pj_uri().extras.endpoint().as_str())?;
+        let persisted_transport = persister.transport()?;
+        let session_transport = self
+            .resolve_session_transport_or_else_fetch(
+                persisted_transport.clone(),
+                Some(endpoint.as_str()),
+            )
+            .await?;
+        if persisted_transport.is_none() {
+            persister.set_transport(&session_transport)?;
+        }
+
+        Ok((session_transport.clone(), session_transport.as_ohttp_transport(&endpoint)?))
     }
 
     /// Handle error by attempting to send an error response over the directory
@@ -852,10 +916,11 @@ impl App {
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (err_req, err_ctx) = session
-            .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
+        let (session_transport, transport) =
+            self.resolve_receiver_transport_or_else_fetch(&session, persister).await?;
+        let (err_req, err_ctx) = session.create_error_request_with_transport(transport)?;
 
-        let err_response = match self.post_request(err_req).await {
+        let err_response = match self.post_request(&session_transport, err_req).await {
             Ok(response) => response,
             Err(e) => return Err(anyhow!("Failed to post error request: {}", e)),
         };
@@ -872,8 +937,12 @@ impl App {
         Ok(())
     }
 
-    async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
-        let http = v2_http_agent(&self.config)?;
+    async fn post_request(
+        &self,
+        session_transport: &SessionTransport,
+        req: payjoin::Request,
+    ) -> Result<reqwest::Response> {
+        let http = v2_http_agent(&self.config, session_transport)?;
         http.post(req.url)
             .header("Content-Type", req.content_type)
             .body(req.body)
@@ -887,5 +956,129 @@ fn map_reqwest_err(e: reqwest::Error) -> anyhow::Error {
     match e.status() {
         Some(status_code) => anyhow!("HTTP request failed: {} {}", status_code, e),
         None => anyhow!("No HTTP response: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
+
+    use payjoin::bitcoin::{Address, FeeRate};
+    use payjoin::persist::NoopSessionPersister;
+    use payjoin::receive::v2::{Initialized, Receiver, ReceiverBuilder};
+    use payjoin::{OhttpKeys, OhttpTransport};
+    use tempfile::TempDir;
+    use tokio::sync::watch;
+    use url::Url;
+
+    use super::ohttp::RelayManager;
+    use super::App;
+    use crate::app::config::{
+        BitcoindConfig, Config, SessionTransport, V2Config, V2Transport, VersionConfig,
+    };
+    use crate::app::wallet::BitcoindWallet;
+    use crate::db::v2::ReceiverPersister;
+    use crate::db::Database;
+
+    const TEST_OHTTP_KEYS_BYTES: [u8; 34] = [
+        0x01, 0x03, 0xba, 0x48, 0xc4, 0x9c, 0x3d, 0x4a, 0x92, 0xa3, 0xad, 0x00, 0xec, 0xc6, 0x3a,
+        0x02, 0x4d, 0xa1, 0x0c, 0xed, 0x02, 0x18, 0x0c, 0x73, 0xec, 0x12, 0xd8, 0xa7, 0xad, 0x2c,
+        0xc9, 0x1b, 0xb4, 0x83,
+    ];
+
+    fn test_bitcoind_config() -> BitcoindConfig {
+        BitcoindConfig {
+            rpchost: Url::parse("http://127.0.0.1:18443").expect("static URL is valid"),
+            cookie: None,
+            rpcuser: "bitcoin".to_owned(),
+            rpcpassword: "bitcoin".to_owned(),
+        }
+    }
+
+    fn test_v2_config(transport: V2Transport, pj_directory: Url) -> V2Config {
+        V2Config {
+            transport,
+            ohttp_keys: None,
+            ohttp_relays: if transport == V2Transport::Relay {
+                vec![Url::parse("https://relay.example").expect("static relay URL is valid")]
+            } else {
+                Vec::new()
+            },
+            pj_directory,
+            socks_proxy: Some(
+                Url::parse("socks5h://127.0.0.1:9050").expect("static SOCKS proxy URL is valid"),
+            ),
+        }
+    }
+
+    async fn test_app(temp_dir: &TempDir, v2_config: V2Config) -> anyhow::Result<App> {
+        let config = Config {
+            db_path: temp_dir.path().join("payjoin.sqlite"),
+            max_fee_rate: Some(FeeRate::BROADCAST_MIN),
+            bitcoind: test_bitcoind_config(),
+            version: Some(VersionConfig::V2(v2_config)),
+            #[cfg(feature = "_manual-tls")]
+            root_certificate: None,
+            #[cfg(feature = "_manual-tls")]
+            certificate_key: None,
+        };
+        let wallet = BitcoindWallet::new(&config.bitcoind).await?;
+        let (_interrupt_tx, interrupt) = watch::channel(());
+        Ok(App {
+            db: Arc::new(Database::create(&config.db_path)?),
+            config,
+            wallet,
+            interrupt,
+            relay_manager: Arc::new(Mutex::new(RelayManager::new())),
+        })
+    }
+
+    fn test_ohttp_keys() -> OhttpKeys {
+        OhttpKeys::try_from(&TEST_OHTTP_KEYS_BYTES[..]).expect("static OHTTP key bytes are valid")
+    }
+
+    fn test_receiver(directory: &str) -> anyhow::Result<Receiver<Initialized>> {
+        let address = Address::from_str("tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4")
+            .expect("static address is valid")
+            .assume_checked();
+        let ohttp_keys = test_ohttp_keys();
+        Ok(ReceiverBuilder::new(address, directory, ohttp_keys)?
+            .build()
+            .save(&NoopSessionPersister::default())?)
+    }
+
+    #[tokio::test]
+    async fn resumed_receiver_uses_persisted_direct_transport() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let persisted_directory =
+            Url::parse("https://persisted.example").expect("static URL is valid");
+        let current_config_directory =
+            Url::parse("https://current.example").expect("static URL is valid");
+        let app = test_app(
+            &temp_dir,
+            test_v2_config(V2Transport::Relay, current_config_directory.clone()),
+        )
+        .await?;
+        let receiver = test_receiver(persisted_directory.as_str())?;
+        let persister = ReceiverPersister::new(app.db.clone())?;
+        let socks_proxy = Url::parse("socks5h://user:pass@127.0.0.1:9050")
+            .expect("static SOCKS proxy URL is valid");
+        persister.set_transport(&SessionTransport::direct(socks_proxy.clone()))?;
+
+        let (session_transport, transport) =
+            app.resolve_receiver_transport_or_else_fetch(&receiver, &persister).await?;
+
+        assert_eq!(session_transport, SessionTransport::direct(socks_proxy));
+
+        match transport {
+            OhttpTransport::Direct(directory) => {
+                assert_eq!(directory, persisted_directory.join("/")?);
+                assert_ne!(directory, current_config_directory.join("/")?);
+            }
+            OhttpTransport::Relay(_) => panic!("expected direct transport"),
+        }
+
+        Ok(())
     }
 }

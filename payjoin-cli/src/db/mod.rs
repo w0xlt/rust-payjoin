@@ -37,6 +37,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS send_sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 receiver_pubkey BLOB NOT NULL,
+                transport_data TEXT,
                 completed_at INTEGER
             )",
             [],
@@ -45,6 +46,7 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS receive_sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transport_data TEXT,
                 completed_at INTEGER
             )",
             [],
@@ -80,6 +82,9 @@ impl Database {
             [],
         )?;
 
+        ensure_column(conn, "send_sessions", "transport_data", "TEXT")?;
+        ensure_column(conn, "receive_sessions", "transport_data", "TEXT")?;
+
         Ok(())
     }
 
@@ -98,6 +103,19 @@ impl Database {
 
         Ok(was_seen_before)
     }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let has_column =
+        columns.collect::<std::result::Result<Vec<_>, _>>()?.into_iter().any(|name| name == column);
+
+    if !has_column {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "v2")]

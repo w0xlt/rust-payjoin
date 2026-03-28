@@ -278,6 +278,13 @@ impl<State> core::ops::DerefMut for Receiver<State> {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.state }
 }
 
+impl<State> Receiver<State> {
+    /// Build a V2 Payjoin URI from the receiver's context
+    pub fn pj_uri<'a>(&self) -> crate::PjUri<'a> {
+        pj_uri(&self.session_context, OutputSubstitution::Disabled)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReceiverBuilder(SessionContext);
 
@@ -505,11 +512,6 @@ impl Receiver<Initialized> {
 
         let inner = OriginalPayload { psbt, params };
         Ok(inner)
-    }
-
-    /// Build a V2 Payjoin URI from the receiver's context
-    pub fn pj_uri<'a>(&self) -> crate::PjUri<'a> {
-        pj_uri(&self.session_context, OutputSubstitution::Disabled)
     }
 
     pub(crate) fn apply_retrieved_original_payload(

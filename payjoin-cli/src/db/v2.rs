@@ -7,6 +7,7 @@ use payjoin::HpkePublicKey;
 use rusqlite::params;
 
 use super::*;
+use crate::app::config::SessionTransport;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionId(i64);
@@ -41,6 +42,14 @@ impl SenderPersister {
     }
 
     pub fn from_id(db: Arc<Database>, id: SessionId) -> Self { Self { db, session_id: id } }
+
+    pub fn transport(&self) -> crate::db::Result<Option<SessionTransport>> {
+        self.db.get_send_session_transport(&self.session_id)
+    }
+
+    pub fn set_transport(&self, transport: &SessionTransport) -> crate::db::Result<()> {
+        self.db.set_send_session_transport(&self.session_id, transport)
+    }
 }
 
 impl SessionPersister for SenderPersister {
@@ -120,6 +129,14 @@ impl ReceiverPersister {
     }
 
     pub fn from_id(db: Arc<Database>, id: SessionId) -> Self { Self { db, session_id: id } }
+
+    pub fn transport(&self) -> crate::db::Result<Option<SessionTransport>> {
+        self.db.get_recv_session_transport(&self.session_id)
+    }
+
+    pub fn set_transport(&self, transport: &SessionTransport) -> crate::db::Result<()> {
+        self.db.set_recv_session_transport(&self.session_id, transport)
+    }
 }
 
 impl SessionPersister for ReceiverPersister {
@@ -230,6 +247,58 @@ impl Database {
         Ok(HpkePublicKey::from_compressed_bytes(&receiver_pubkey).expect("Valid receiver pubkey"))
     }
 
+    pub(crate) fn get_send_session_transport(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionTransport>> {
+        let conn = self.get_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT transport_data FROM send_sessions WHERE session_id = ?1")?;
+        let transport_data: Option<String> =
+            stmt.query_row(params![session_id.0], |row| row.get(0))?;
+        deserialize_transport(transport_data)
+    }
+
+    pub(crate) fn set_send_session_transport(
+        &self,
+        session_id: &SessionId,
+        transport: &SessionTransport,
+    ) -> Result<()> {
+        let conn = self.get_connection()?;
+        let transport_data = serde_json::to_string(transport).map_err(Error::Serialize)?;
+        conn.execute(
+            "UPDATE send_sessions SET transport_data = ?1 WHERE session_id = ?2",
+            params![transport_data, session_id.0],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_recv_session_transport(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionTransport>> {
+        let conn = self.get_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT transport_data FROM receive_sessions WHERE session_id = ?1")?;
+        let transport_data: Option<String> =
+            stmt.query_row(params![session_id.0], |row| row.get(0))?;
+        deserialize_transport(transport_data)
+    }
+
+    pub(crate) fn set_recv_session_transport(
+        &self,
+        session_id: &SessionId,
+        transport: &SessionTransport,
+    ) -> Result<()> {
+        let conn = self.get_connection()?;
+        let transport_data = serde_json::to_string(transport).map_err(Error::Serialize)?;
+        conn.execute(
+            "UPDATE receive_sessions SET transport_data = ?1 WHERE session_id = ?2",
+            params![transport_data, session_id.0],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn get_inactive_send_session_ids(&self) -> Result<Vec<(SessionId, u64)>> {
         let conn = self.get_connection()?;
         let mut stmt = conn.prepare(
@@ -266,5 +335,49 @@ impl Database {
             session_ids.push((session_id, completed_at));
         }
         Ok(session_ids)
+    }
+}
+
+fn deserialize_transport(transport_data: Option<String>) -> Result<Option<SessionTransport>> {
+    transport_data
+        .map(|transport_data| {
+            serde_json::from_str::<SessionTransport>(&transport_data).map_err(Error::Deserialize)
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use payjoin::HpkeKeyPair;
+    use tempfile::TempDir;
+    use url::Url;
+
+    use super::{Database, ReceiverPersister, SenderPersister};
+    use crate::app::config::SessionTransport;
+
+    #[test]
+    fn persisters_roundtrip_transport_data() -> crate::db::Result<()> {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db = Arc::new(Database::create(temp_dir.path().join("payjoin.sqlite"))?);
+        let sender =
+            SenderPersister::new(db.clone(), HpkeKeyPair::gen_keypair().1).expect("sender session");
+        let receiver = ReceiverPersister::new(db.clone()).expect("receiver session");
+        let relay = SessionTransport::relay(
+            Url::parse("https://relay.example").expect("static relay URL should be valid"),
+        );
+        let direct = SessionTransport::direct(
+            Url::parse("socks5h://user:pass@127.0.0.1:9050")
+                .expect("static SOCKS proxy URL should be valid"),
+        );
+
+        sender.set_transport(&relay)?;
+        receiver.set_transport(&direct)?;
+
+        assert_eq!(sender.transport()?, Some(relay));
+        assert_eq!(receiver.transport()?, Some(direct));
+
+        Ok(())
     }
 }

@@ -34,6 +34,30 @@ impl V2Transport {
     }
 }
 
+#[cfg(feature = "v2")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) enum SessionTransport {
+    Relay { relay: Url },
+    Direct { socks_proxy: Url },
+}
+
+#[cfg(feature = "v2")]
+impl SessionTransport {
+    pub(crate) fn direct(socks_proxy: Url) -> Self { Self::Direct { socks_proxy } }
+
+    pub(crate) fn relay(relay: Url) -> Self { Self::Relay { relay } }
+
+    pub(crate) fn as_ohttp_transport(
+        &self,
+        directory: &Url,
+    ) -> std::result::Result<payjoin::OhttpTransport, url::ParseError> {
+        match self {
+            Self::Relay { relay } => Ok(payjoin::OhttpTransport::Relay(relay.clone())),
+            Self::Direct { .. } => Ok(payjoin::OhttpTransport::Direct(directory.join("/")?)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BitcoindConfig {
     pub rpchost: Url,
