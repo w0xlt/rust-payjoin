@@ -19,11 +19,11 @@ use payjoin::send::v2::{
 use payjoin::{ImplementationError, PjParam, Uri};
 use tokio::sync::watch;
 
-use super::config::Config;
+use super::config::{Config, V2Transport};
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
 use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
-use crate::app::{handle_interrupt, http_agent};
+use crate::app::{handle_interrupt, v2_http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
@@ -499,9 +499,8 @@ impl App {
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let (req, ctx) = sender.create_v2_post_request(
-            self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?.as_str(),
-        )?;
+        let transport = self.resolve_transport_or_else_fetch(Some(&sender.endpoint())).await?;
+        let (req, ctx) = sender.create_v2_post_request_with_transport(transport)?;
         let response = self.post_request(req).await?;
         println!("Posted original proposal...");
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
@@ -513,11 +512,11 @@ impl App {
         sender: Sender<PollingForProposal>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let ohttp_relay = self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?;
+        let transport = self.resolve_transport_or_else_fetch(Some(&sender.endpoint())).await?;
         let mut session = sender.clone();
         // Long poll until we get a response
         loop {
-            let (req, ctx) = session.create_poll_request(ohttp_relay.as_str())?;
+            let (req, ctx) = session.create_poll_request_with_transport(transport.clone())?;
             let response = self.post_request(req).await?;
             let res = session.process_response(&response.bytes().await?, ctx).save(persister);
             match res {
@@ -827,6 +826,26 @@ impl App {
         Ok(ohttp_relay)
     }
 
+    async fn resolve_transport_or_else_fetch(
+        &self,
+        directory: Option<impl payjoin::IntoUrl>,
+    ) -> Result<payjoin::OhttpTransport> {
+        let directory = directory.map(|url| url.into_url()).transpose()?;
+        match self.config.v2()?.transport {
+            V2Transport::Relay => {
+                let relay = self
+                    .unwrap_relay_or_else_fetch(directory.as_ref().map(url::Url::as_str))
+                    .await?;
+                Ok(payjoin::OhttpTransport::Relay(relay))
+            }
+            V2Transport::Direct => {
+                let directory = directory.unwrap_or(self.config.v2()?.pj_directory.clone());
+                let directory = directory.join("/")?;
+                Ok(payjoin::OhttpTransport::Direct(directory))
+            }
+        }
+    }
+
     /// Handle error by attempting to send an error response over the directory
     async fn handle_error(
         &self,
@@ -854,7 +873,7 @@ impl App {
     }
 
     async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
-        let http = http_agent(&self.config)?;
+        let http = v2_http_agent(&self.config)?;
         http.post(req.url)
             .header("Content-Type", req.content_type)
             .body(req.body)
