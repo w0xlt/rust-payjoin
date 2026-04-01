@@ -52,7 +52,8 @@ pub async fn serve(config: Config, meter_provider: Option<SdkMeterProvider>) -> 
 
     let services = Services {
         directory,
-        relay: crate::ohttp_relay::Service::new(sentinel_tag).await,
+        relay: crate::ohttp_relay::Service::new(sentinel_tag, config.outbound_socks_proxy.clone())
+            .await?,
         metrics,
         #[cfg(feature = "access-control")]
         geoip,
@@ -101,8 +102,9 @@ pub async fn serve_manual_tls(
             sentinel_tag,
             root_store,
             default_gateway,
+            config.outbound_socks_proxy.clone(),
         )
-        .await,
+        .await?,
         metrics,
         #[cfg(feature = "access-control")]
         geoip,
@@ -167,7 +169,8 @@ pub async fn serve_acme(
 
     let services = Services {
         directory,
-        relay: crate::ohttp_relay::Service::new(sentinel_tag).await,
+        relay: crate::ohttp_relay::Service::new(sentinel_tag, config.outbound_socks_proxy.clone())
+            .await?,
         metrics,
         #[cfg(feature = "access-control")]
         geoip,
@@ -448,6 +451,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             Duration::from_secs(2),
             None,
+            None,
         );
 
         let mut root_store = RootCertStore::empty();
@@ -544,13 +548,14 @@ mod tests {
             tempdir.path().to_path_buf(),
             Duration::from_secs(2),
             None,
+            None,
         );
 
         let sentinel_tag = generate_sentinel_tag();
         let metrics = MetricsService::new(Some(provider.clone()));
         let services = Services {
             directory: init_directory(&config, sentinel_tag, &metrics).await.unwrap(),
-            relay: crate::ohttp_relay::Service::new(sentinel_tag).await,
+            relay: crate::ohttp_relay::Service::new(sentinel_tag, None).await.unwrap(),
             metrics,
             #[cfg(feature = "access-control")]
             geoip: None,
@@ -593,13 +598,14 @@ mod tests {
             tempdir.path().to_path_buf(),
             Duration::from_secs(2),
             None,
+            None,
         );
 
         let sentinel_tag = generate_sentinel_tag();
         let metrics = MetricsService::new(Some(provider.clone()));
         let services = Services {
             directory: init_directory(&config, sentinel_tag, &metrics).await.unwrap(),
-            relay: crate::ohttp_relay::Service::new(sentinel_tag).await,
+            relay: crate::ohttp_relay::Service::new(sentinel_tag, None).await.unwrap(),
             metrics,
             #[cfg(feature = "access-control")]
             geoip: None,

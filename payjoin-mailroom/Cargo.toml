@@ -20,7 +20,7 @@ connect-bootstrap = []
 ws-bootstrap = ["dep:tokio-tungstenite", "dep:rustls"]
 _manual-tls = ["dep:axum-server", "dep:rustls"]
 acme = ["dep:tokio-rustls-acme", "dep:axum-server", "dep:rustls"]
-access-control = ["dep:flate2", "dep:ipnet", "dep:maxminddb", "dep:reqwest"]
+access-control = ["dep:flate2", "dep:ipnet", "dep:maxminddb"]
 telemetry = ["dep:opentelemetry-otlp"]
 
 [dependencies]
@@ -58,10 +58,12 @@ opentelemetry_sdk = "0.31"
 payjoin = { version = "0.25.0", features = [
   "directory",
 ], default-features = false }
+percent-encoding = "2.3.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
-], optional = true }
+  "socks",
+] }
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
 ], optional = true }
@@ -69,12 +71,14 @@ serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.47", features = ["full"] }
 tokio-listener = { version = "0.5", features = ["axum08", "serde"] }
 tokio-rustls-acme = { version = "0.9.0", features = ["axum"], optional = true }
+tokio-socks = "0.5.2"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-tungstenite = { version = "0.27.0", optional = true }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-segmentation = "=1.12.0"
+url = { version = "2.5.4", features = ["serde"] }
 
 # unicode segmentation is ignored because it needs to be pinned due to the use of an unstable 
 # feature from within the config crate

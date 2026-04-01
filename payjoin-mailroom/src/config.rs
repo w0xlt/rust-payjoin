@@ -14,6 +14,7 @@ pub struct Config {
     pub timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration_secs")]
     pub mailbox_ttl: Duration,
+    pub outbound_socks_proxy: Option<url::Url>,
     pub v1: Option<V1Config>,
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<TelemetryConfig>,
@@ -88,6 +89,7 @@ impl Default for Config {
             storage_dir: PathBuf::from("./data"),
             timeout: Duration::from_secs(30),
             mailbox_ttl: Duration::from_secs(60 * 60 * 24 * 7), // 1 week
+            outbound_socks_proxy: None,
             v1: None,
             #[cfg(feature = "telemetry")]
             telemetry: None,
@@ -112,6 +114,7 @@ impl Config {
         listener: ListenerAddress,
         storage_dir: PathBuf,
         timeout: Duration,
+        outbound_socks_proxy: Option<url::Url>,
         v1: Option<V1Config>,
     ) -> Self {
         Self {
@@ -119,6 +122,7 @@ impl Config {
             storage_dir,
             timeout,
             mailbox_ttl: Duration::from_secs(60 * 60 * 24 * 7), // 1 week
+            outbound_socks_proxy,
             v1,
             #[cfg(feature = "telemetry")]
             telemetry: None,

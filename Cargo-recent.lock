@@ -2845,6 +2845,7 @@ dependencies = [
  "opentelemetry_sdk",
  "payjoin",
  "payjoin-test-utils",
+ "percent-encoding",
  "rand 0.8.5",
  "rcgen 0.12.1",
  "reqwest",
@@ -2855,12 +2856,14 @@ dependencies = [
  "tokio-listener",
  "tokio-rustls 0.26.2",
  "tokio-rustls-acme",
+ "tokio-socks",
  "tokio-stream",
  "tokio-tungstenite",
  "tower",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "url",
  "uuid",
 ]
 
