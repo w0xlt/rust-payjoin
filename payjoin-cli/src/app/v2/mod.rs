@@ -23,7 +23,7 @@ use super::config::Config;
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
 use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
-use crate::app::{handle_interrupt, http_agent, v2_http_agent};
+use crate::app::{handle_interrupt, v2_http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
@@ -553,7 +553,7 @@ impl App {
         loop {
             let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
             println!("Polling receive request...");
-            let ohttp_response = self.post_request(req).await?;
+            let ohttp_response = self.post_v2_request(req).await?;
             let state_transition = session
                 .process_response(ohttp_response.bytes().await?.to_vec().as_slice(), context)
                 .save(persister);
@@ -751,7 +751,7 @@ impl App {
         let (req, ohttp_ctx) = proposal
             .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
             .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
-        let res = self.post_request(req).await?;
+        let res = self.post_v2_request(req).await?;
         let payjoin_psbt = proposal.psbt().clone();
         let session = proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
         println!(
@@ -837,7 +837,7 @@ impl App {
         let (err_req, err_ctx) = session
             .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
 
-        let err_response = match self.post_request(err_req).await {
+        let err_response = match self.post_v2_request(err_req).await {
             Ok(response) => response,
             Err(e) => return Err(anyhow!("Failed to post error request: {}", e)),
         };
@@ -852,16 +852,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
-        let http = http_agent(&self.config)?;
-        http.post(req.url)
-            .header("Content-Type", req.content_type)
-            .body(req.body)
-            .send()
-            .await
-            .map_err(map_reqwest_err)
     }
 
     async fn post_v2_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
