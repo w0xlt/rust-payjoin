@@ -18,18 +18,19 @@ pub mod ws;
 pub(crate) async fn handle_ohttp_keys<B>(
     req: Request<B>,
     gateway_origin: GatewayUri,
+    connector: crate::ohttp_relay::GatewayConnector,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Error>
 where
     B: Send + Debug + 'static,
 {
     #[cfg(feature = "connect-bootstrap")]
     if connect::is_connect_request(&req) {
-        return connect::try_upgrade(req, gateway_origin).await;
+        return connect::try_upgrade(req, gateway_origin, connector).await;
     }
 
     #[cfg(feature = "ws-bootstrap")]
     if ws::is_websocket_request(&req) {
-        return ws::try_upgrade(req, gateway_origin).await;
+        return ws::try_upgrade(req, gateway_origin, connector).await;
     }
 
     Err(Error::BadRequest("Not a supported proxy upgrade request".to_string()))

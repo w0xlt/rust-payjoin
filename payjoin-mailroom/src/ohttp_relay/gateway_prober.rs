@@ -1,9 +1,11 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
-use std::error::Error;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
+#[cfg(test)]
+use std::io::Read;
 use std::time::Duration;
 
+#[cfg(test)]
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::BytesMut;
 use futures::future::{self, FutureExt};
@@ -17,6 +19,7 @@ use super::gateway_uri::GatewayUri;
 const MAGIC_BIP77_PURPOSE: &[u8] = b"BIP77 454403bb-9f7b-4385-b31f-acd2dae20b7e";
 const ALLOWED_PURPOSES_CONTENT_TYPE: &str = "application/x-ohttp-allowed-purposes";
 const DEFAULT_CAPACITY: usize = 1000;
+const MAX_ALLOWED_PURPOSES_BODY_BYTES: usize = 4096;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub(crate) struct Policy {
@@ -223,26 +226,44 @@ impl Prober {
             return None;
         }
 
-        let mut body = BytesMut::new();
-        while let Some(next) = res.frame().await {
-            let frame = next.ok()?;
-            if let Some(chunk) = frame.data_ref() {
-                body.extend_from_slice(chunk)
-            }
-        }
-
         if res.headers().get(hyper::header::CONTENT_TYPE)?
             != hyper::header::HeaderValue::from_static(ALLOWED_PURPOSES_CONTENT_TYPE)
         {
             return None;
         }
 
-        let allowed_purposes = parse_alpn_encoded(&body).ok()?;
-        if allowed_purposes.contains(&MAGIC_BIP77_PURPOSE.to_vec()) {
-            return Some(());
-        }
+        let mut body = BytesMut::new();
+        loop {
+            if let Some(allows_bip77) = parse_allowed_purposes_prefix(&body).ok()? {
+                return allows_bip77.then_some(());
+            }
+            if body.len() == MAX_ALLOWED_PURPOSES_BODY_BYTES {
+                return None;
+            }
 
-        None
+            let frame = match res.frame().await {
+                Some(Ok(frame)) => frame,
+                Some(Err(_)) => return None,
+                None => return None,
+            };
+            let Some(chunk) = frame.data_ref() else {
+                continue;
+            };
+
+            if body.len() == MAX_ALLOWED_PURPOSES_BODY_BYTES {
+                return None;
+            }
+
+            let remaining = MAX_ALLOWED_PURPOSES_BODY_BYTES - body.len();
+            let to_copy = remaining.min(chunk.len());
+            body.extend_from_slice(&chunk[..to_copy]);
+            if let Some(allows_bip77) = parse_allowed_purposes_prefix(&body).ok()? {
+                return allows_bip77.then_some(());
+            }
+            if to_copy < chunk.len() {
+                return None;
+            }
+        }
     }
 
     /// Probes a target gateway by attempting to send a GET request.
@@ -258,7 +279,7 @@ impl Prober {
             ))
             .expect("creating GET request must succeed");
 
-        let mut res = self.client.request(req).await;
+        let mut res = self.client.request_streaming(req).await;
 
         // opt-in is tracked via a separate mutable variable since it only
         // occurs in the first sub-branch of this large conditional, which is
@@ -316,6 +337,7 @@ impl Prober {
     }
 }
 
+#[cfg(test)]
 fn parse_alpn_encoded(input: &[u8]) -> std::io::Result<Vec<Vec<u8>>> {
     let mut input = input;
     let mut output: Vec<Vec<u8>> = Vec::with_capacity(input.read_u16::<BigEndian>()?.into());
@@ -334,6 +356,33 @@ fn parse_alpn_encoded(input: &[u8]) -> std::io::Result<Vec<Vec<u8>>> {
     }
 
     Ok(output)
+}
+
+fn parse_allowed_purposes_prefix(input: &[u8]) -> std::io::Result<Option<bool>> {
+    if input.len() < 2 {
+        return Ok(None);
+    }
+
+    let count = u16::from_be_bytes([input[0], input[1]]) as usize;
+    let mut offset = 2;
+    let mut allows_bip77 = false;
+
+    for _ in 0..count {
+        if input.len() <= offset {
+            return Ok(None);
+        }
+        let length = usize::from(input[offset]);
+        offset += 1;
+
+        if input.len() < offset + length {
+            return Ok(None);
+        }
+
+        allows_bip77 |= &input[offset..offset + length] == MAGIC_BIP77_PURPOSE;
+        offset += length;
+    }
+
+    Ok(Some(allows_bip77))
 }
 
 #[derive(Debug)]
@@ -398,6 +447,8 @@ mod tests {
     use std::time::Duration;
 
     use mockito::Server;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::time::advance;
 
     use super::*;
@@ -574,6 +625,59 @@ mod tests {
         // test cached result, mockit server will cause failure if another GET query is sent
         let status = prober.check_opt_in(&url).await.expect("second probe must succeed");
         assert!(status.bip77_allowed, "gateway opt-in should be cached");
+    }
+
+    #[tokio::test]
+    async fn test_opt_in_probe_does_not_wait_for_chunked_response_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test server should bind");
+        let port = listener.local_addr().expect("test server should expose a local address").port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test server should accept");
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 1024];
+                let bytes_read =
+                    stream.read(&mut buf).await.expect("test server should read the request");
+                assert!(bytes_read > 0, "request should not terminate before the headers");
+                request.extend_from_slice(&buf[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {ALLOWED_PURPOSES_CONTENT_TYPE}\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n"
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("test server should write the response headers");
+            stream
+                .write_all(format!("{:x}\r\n", BIP77_OPT_IN_RESPONSE.len()).as_bytes())
+                .await
+                .expect("test server should write the chunk length");
+            stream
+                .write_all(BIP77_OPT_IN_RESPONSE)
+                .await
+                .expect("test server should write the first chunk body");
+            stream.write_all(b"\r\n").await.expect("test server should terminate the first chunk");
+            stream.flush().await.expect("test server should flush the first chunk");
+
+            std::future::pending::<()>().await;
+        });
+
+        let url = GatewayUri::from_str(&format!("http://127.0.0.1:{port}"))
+            .expect("must be able to parse test server URL");
+        let prober = Prober::default();
+
+        let status = tokio::time::timeout(Duration::from_millis(200), prober.check_opt_in(&url))
+            .await
+            .expect("probe should not wait for the chunked response to terminate")
+            .expect("probe must succeed");
+        assert!(status.bip77_allowed, "BIP77 opt-in should be detected from the first chunk");
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -762,6 +866,36 @@ mod tests {
         assert_eq!(
             result[0], MAGIC_BIP77_PURPOSE,
             "the element should be the bip77 opt-in magic string"
+        );
+    }
+
+    #[test]
+    fn test_parse_allowed_purposes_prefix() {
+        assert_eq!(
+            parse_allowed_purposes_prefix(&BIP77_OPT_IN_RESPONSE[..2])
+                .expect("partial prefix should not error"),
+            None,
+            "partial ALPN data should be treated as incomplete"
+        );
+        assert_eq!(
+            parse_allowed_purposes_prefix(BIP77_OPT_IN_RESPONSE).expect("full prefix should parse"),
+            Some(true),
+            "complete ALPN data should report BIP77 opt-in"
+        );
+
+        let no_opt_in = b"\x00\x01\x03foo";
+        assert_eq!(
+            parse_allowed_purposes_prefix(no_opt_in).expect("complete prefix should parse"),
+            Some(false),
+            "complete ALPN data without the magic purpose should report opt-out"
+        );
+
+        let with_trailing = [BIP77_OPT_IN_RESPONSE, b"extra"].concat();
+        assert_eq!(
+            parse_allowed_purposes_prefix(&with_trailing)
+                .expect("complete prefix with trailing data should parse"),
+            Some(true),
+            "the prefix parser should stop once the ALPN vector is complete"
         );
     }
 }
