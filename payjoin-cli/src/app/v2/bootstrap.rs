@@ -223,9 +223,7 @@ where
                     Poll::Ready(this.ws_stream.start_send_unpin(Message::Pong(data)).map_err(map_ws_error))
                 }
                 Message::Pong(_) => Poll::Pending,
-                Message::Close(_) => {
-                    Poll::Ready(this.ws_stream.start_send_unpin(Message::Close(None)).map_err(map_ws_error))
-                }
+                Message::Close(_) => Poll::Ready(Ok(())),
                 _ => Poll::Pending,
             },
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(map_ws_error(e))),

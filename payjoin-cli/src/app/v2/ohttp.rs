@@ -91,12 +91,14 @@ async fn fetch_ohttp_keys(
                             &cert_der,
                         )
                         .await
+                        .map_err(anyhow::Error::from)
                     } else {
                         payjoin::io::fetch_ohttp_keys(
                             selected_relay.as_str(),
                             payjoin_directory.as_str(),
                         )
                         .await
+                        .map_err(anyhow::Error::from)
                     }
                 }
                 #[cfg(not(feature = "_manual-tls"))]
@@ -116,7 +118,9 @@ async fn fetch_ohttp_keys(
                 if let Some(payjoin::io::Error::UnexpectedStatusCode(code)) =
                     err.downcast_ref::<payjoin::io::Error>()
                 {
-                    return Err(payjoin::io::Error::UnexpectedStatusCode(*code).into());
+                    return Err(
+                        payjoin::io::Error::UnexpectedStatusCode(code.to_owned()).into()
+                    );
                 }
                 tracing::debug!("Failed to connect to relay: {selected_relay}, {err:?}");
                 relay_manager

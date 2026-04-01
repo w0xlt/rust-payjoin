@@ -49,6 +49,18 @@ impl V2Config {
                     "BIP77 SOCKS proxy must use the socks5h:// scheme".to_owned(),
                 ));
             }
+            if self.ohttp_relays.iter().any(|relay| relay.scheme() != "http") {
+                return Err(ConfigError::Message(
+                    "BIP77 SOCKS relay mode currently requires http:// relay URLs".to_owned(),
+                ));
+            }
+            #[cfg(not(feature = "_manual-tls"))]
+            if self.pj_directory.scheme() != "http" {
+                return Err(ConfigError::Message(
+                    "BIP77 SOCKS relay mode without _manual-tls requires an http:// directory URL"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(self)
     }
@@ -409,6 +421,46 @@ mod tests {
         assert!(
             err.to_string().contains("socks5h://"),
             "validation error should explain the required scheme"
+        );
+    }
+
+    #[test]
+    fn v2_config_rejects_https_relays_in_socks_mode() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![url::Url::parse("https://relay.example").expect("static URL is valid")],
+            pj_directory: url::Url::parse("http://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+        };
+
+        let err = config.validate().expect_err("https relay should be rejected in SOCKS mode");
+        assert!(
+            err.to_string().contains("http:// relay"),
+            "validation error should explain the relay scheme restriction"
+        );
+    }
+
+    #[cfg(not(feature = "_manual-tls"))]
+    #[test]
+    fn v2_config_rejects_https_directory_without_manual_tls() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![url::Url::parse("http://relay.example").expect("static URL is valid")],
+            pj_directory: url::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+        };
+
+        let err =
+            config.validate().expect_err("https directory should be rejected without _manual-tls");
+        assert!(
+            err.to_string().contains("http:// directory"),
+            "validation error should explain the directory scheme restriction"
         );
     }
 }
