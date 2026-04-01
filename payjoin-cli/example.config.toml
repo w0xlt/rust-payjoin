@@ -50,6 +50,9 @@ rpcpassword = "password"
 # [v2]
 # pj_directory = "https://payjo.in"
 # ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com", "https://example.com"]
+# # Optional: route BIP77 relay traffic over Tor via a SOCKS5h proxy.
+# # This mode is intended for `http://...onion` relay and directory URLs.
+# socks_proxy = "socks5h://127.0.0.1:9050"
 # # Optional: The HPKE keys which need to be fetched ahead of time from the pj_endpoint
 # # for the payjoin packets to be encrypted.
 # # These can now be fetched and no longer need to be configured.

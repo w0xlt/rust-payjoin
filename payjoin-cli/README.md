@@ -94,6 +94,21 @@ pj_directory = "https://payjo.in"
 ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"]
 ```
 
+To route relay-mode BIP77 traffic over Tor, add a `socks5h://` proxy:
+
+```toml
+[v2]
+pj_directory = "http://directoryexample.onion"
+ohttp_relays = ["http://relayexample.onion"]
+socks_proxy = "socks5h://127.0.0.1:9050"
+```
+
+In this mode, `payjoin-cli` still uses the normal BIP77 relay flow:
+
+`client -> relay -> directory`
+
+but the client's connection to the relay is made through Tor/SOCKS, and OHTTP key bootstrap also goes through the relay instead of contacting the directory directly. This mode is intended for plain `http://...onion` relay and directory URLs, so it does not require TLS.
+
 Now, the receiver must generate an address to receive the payment. The format is:
 
 ```sh
