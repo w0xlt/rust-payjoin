@@ -11,6 +11,17 @@ Note that this binary is under active development and thus the CLI and configura
 
 payjoin-mailroom reads configuration from `config.toml` (or the path given with `--config`). Every setting can also be supplied via environment variables prefixed with `PJ_`, using double underscores for nesting (e.g., `PJ_TELEMETRY__ENDPOINT`).
 
+To route the relay's outbound gateway traffic over Tor or another SOCKS proxy,
+set `outbound_socks_proxy` to a `socks5h://` URL:
+
+```toml
+outbound_socks_proxy = "socks5h://127.0.0.1:9050"
+```
+
+This applies to the relay's connections to remote OHTTP gateways, including
+relay bootstrap traffic. The `socks5h://` scheme is required so hostname
+resolution happens at the proxy.
+
 ## Usage
 
 ### Cargo
