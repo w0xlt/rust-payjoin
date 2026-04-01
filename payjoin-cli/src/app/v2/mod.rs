@@ -22,11 +22,13 @@ use tokio::sync::watch;
 use super::config::Config;
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
+#[cfg(feature = "v1")]
+use crate::app::http_agent;
 use crate::app::v2::ohttp::{
     unwrap_ohttp_keys_or_else_fetch, unwrap_relay_or_else_fetch as resolve_relay_or_else_fetch,
     RelayManager,
 };
-use crate::app::{handle_interrupt, http_agent, v2_http_agent};
+use crate::app::{handle_interrupt, v2_http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId, SocksAuth};
 use crate::db::Database;
 
@@ -47,6 +49,26 @@ const W_ID: usize = 12;
 const W_ROLE: usize = 25;
 const W_DONE: usize = 15;
 const W_STATUS: usize = 15;
+
+async fn await_resume_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
+    let mut first_error = None;
+
+    for task in tasks {
+        let result = task
+            .await
+            .context("resumed session task panicked")
+            .and_then(|session_result| session_result);
+        if let Err(err) = result {
+            if first_error.is_none() {
+                first_error = Some(err);
+            } else {
+                tracing::warn!("Additional resumed session task failed: {err:?}");
+            }
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
 
 async fn post_v2_request(
     config: &Config,
@@ -127,7 +149,6 @@ pub(crate) struct App {
     db: Arc<Database>,
     wallet: BitcoindWallet,
     interrupt: watch::Receiver<()>,
-    relay_manager: Arc<Mutex<RelayManager>>,
 }
 
 trait StatusText {
@@ -230,13 +251,7 @@ impl AppTrait for App {
         let (interrupt_tx, interrupt_rx) = watch::channel(());
         tokio::spawn(handle_interrupt(interrupt_tx));
         let wallet = BitcoindWallet::new(&config.bitcoind).await?;
-        let app = Self {
-            config,
-            db,
-            wallet,
-            interrupt: interrupt_rx,
-            relay_manager: Self::new_relay_manager(),
-        };
+        let app = Self { config, db, wallet, interrupt: interrupt_rx };
         app.wallet()
             .network()
             .context("Failed to connect to bitcoind. Check config RPC connection.")?;
@@ -347,36 +362,51 @@ impl AppTrait for App {
     }
 
     async fn receive_payjoin(&self, amount: Amount) -> Result<()> {
-        let address = self.wallet().get_new_address()?;
+        let relay_manager = Self::new_relay_manager();
         let persister = ReceiverPersister::new(self.db.clone())?;
         let session_socks_auth =
-            if self.config.v2()?.socks_proxy.is_some() && self.config.v2()?.tor_stream_isolation {
-                Some(persister.get_or_create_socks_auth()?)
-            } else {
-                None
-            };
-        let ohttp_keys = unwrap_ohttp_keys_or_else_fetch(
-            &self.config,
-            None,
-            self.relay_manager.clone(),
-            session_socks_auth.as_ref(),
-        )
-        .await?
-        .ohttp_keys;
-        let session =
-            ReceiverBuilder::new(address, self.config.v2()?.pj_directory.as_str(), ohttp_keys)?
+            Self::close_failed_receiver_init(self.receiver_socks_auth(&persister), &persister)?;
+        let address =
+            Self::close_failed_receiver_init(self.wallet().get_new_address(), &persister)?;
+        let ohttp_keys = Self::close_failed_receiver_init(
+            unwrap_ohttp_keys_or_else_fetch(
+                &self.config,
+                None,
+                relay_manager.clone(),
+                session_socks_auth.as_ref(),
+            )
+            .await
+            .map(|validated| validated.ohttp_keys),
+            &persister,
+        )?;
+        let pj_directory = Self::close_failed_receiver_init(
+            self.config.v2().map(|v2| v2.pj_directory.clone()),
+            &persister,
+        )?;
+        let receiver_builder = Self::close_failed_receiver_init(
+            ReceiverBuilder::new(address, pj_directory.as_str(), ohttp_keys),
+            &persister,
+        )?;
+        let session = Self::close_failed_receiver_init(
+            receiver_builder
                 .with_amount(amount)
                 .with_max_fee_rate(self.config.max_fee_rate.unwrap_or(FeeRate::BROADCAST_MIN))
                 .build()
-                .save(&persister)?;
+                .save(&persister),
+            &persister,
+        )?;
 
         println!("Receive session established");
         let pj_uri = session.pj_uri();
         println!("Request Payjoin by sharing this Payjoin Uri:");
         println!("{pj_uri}");
 
-        self.process_receiver_session(ReceiveSession::Initialized(session.clone()), &persister)
-            .await?;
+        self.process_receiver_session(
+            ReceiveSession::Initialized(session.clone()),
+            &persister,
+            relay_manager,
+        )
+        .await?;
         Ok(())
     }
 
@@ -398,8 +428,15 @@ impl AppTrait for App {
             let recv_persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
             match replay_receiver_event_log(&recv_persister) {
                 Ok((receiver_state, _)) => {
+                    let relay_manager = Self::new_relay_manager();
                     tasks.push(tokio::spawn(async move {
-                        self_clone.process_receiver_session(receiver_state, &recv_persister).await
+                        self_clone
+                            .process_receiver_session(
+                                receiver_state,
+                                &recv_persister,
+                                relay_manager,
+                            )
+                            .await
                     }));
                 }
                 Err(e) => {
@@ -431,11 +468,8 @@ impl AppTrait for App {
 
         let mut interrupt = self.interrupt.clone();
         tokio::select! {
-            _ = async {
-                for task in tasks {
-                    let _ = task.await;
-                }
-            } => {
+            result = await_resume_tasks(tasks) => {
+                result?;
                 println!("All resumed sessions completed.");
             }
             _ = interrupt.changed() => {
@@ -584,6 +618,19 @@ impl App {
         }
     }
 
+    fn close_failed_receiver_init<T, E>(
+        result: std::result::Result<T, E>,
+        persister: &ReceiverPersister,
+    ) -> Result<T>
+    where
+        E: Into<anyhow::Error>,
+    {
+        result.map_err(|err| {
+            Self::close_failed_session(persister, persister.session_id(), "receiver");
+            err.into()
+        })
+    }
+
     fn uses_tor_stream_isolation(&self) -> Result<bool> {
         let v2 = self.config.v2()?;
         Ok(v2.socks_proxy.is_some() && v2.tor_stream_isolation)
@@ -689,15 +736,22 @@ impl App {
         &self,
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
-        let ohttp_relay =
-            self.unwrap_relay_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
+        let endpoint = Url::parse(&session.pj_uri().extras.endpoint())?;
+        let session_socks_auth = self.receiver_socks_auth(persister)?;
 
         let mut session = session;
         loop {
-            let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
+            let (ohttp_response, context) = post_v2_request_with_relay_failover(
+                &self.config,
+                relay_manager.clone(),
+                Some(endpoint.clone()),
+                session_socks_auth.as_ref(),
+                |relay| session.create_poll_request(relay.as_str()),
+            )
+            .await?;
             println!("Polling receive request...");
-            let ohttp_response = self.post_request(req).await?;
             let state_transition = session
                 .process_response(ohttp_response.bytes().await?.to_vec().as_slice(), context)
                 .save(persister);
@@ -719,11 +773,12 @@ impl App {
         &self,
         session: ReceiveSession,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let res = {
             match session {
                 ReceiveSession::Initialized(proposal) =>
-                    self.read_from_directory(proposal, persister).await,
+                    self.read_from_directory(proposal, persister, relay_manager).await,
                 ReceiveSession::UncheckedOriginalPayload(proposal) =>
                     self.check_proposal(proposal, persister).await,
                 ReceiveSession::MaybeInputsOwned(proposal) =>
@@ -757,10 +812,11 @@ impl App {
         &self,
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let mut interrupt = self.interrupt.clone();
         let receiver = tokio::select! {
-            res = self.long_poll_fallback(session, persister) => res,
+            res = self.long_poll_fallback(session, persister, relay_manager) => res,
             _ = interrupt.changed() => {
                 println!("Interrupted. Call the `resume` command to resume all sessions.");
                 return Err(anyhow!("Interrupted"));
@@ -892,10 +948,20 @@ impl App {
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (req, ohttp_ctx) = proposal
-            .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
-            .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
-        let res = self.post_request(req).await?;
+        let relay_manager = Self::new_relay_manager();
+        let session_socks_auth = self.receiver_socks_auth(persister)?;
+        let (res, ohttp_ctx) = post_v2_request_with_relay_failover(
+            &self.config,
+            relay_manager,
+            None,
+            session_socks_auth.as_ref(),
+            |relay| {
+                proposal
+                    .create_post_request(relay.as_str())
+                    .map_err(|e| anyhow!("v2 req extraction failed {}", e))
+            },
+        )
+        .await?;
         let payjoin_psbt = proposal.psbt().clone();
         let session = proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
         println!(
@@ -955,41 +1021,23 @@ impl App {
         }
     }
 
-    async fn unwrap_relay_or_else_fetch(
-        &self,
-        directory: Option<impl payjoin::IntoUrl>,
-    ) -> Result<payjoin::Url> {
-        let directory = directory.map(|url| url.into_url()).transpose()?;
-        let selected_relay =
-            self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
-        let ohttp_relay = match selected_relay {
-            Some(relay) => relay,
-            None =>
-                unwrap_ohttp_keys_or_else_fetch(
-                    &self.config,
-                    directory,
-                    self.relay_manager.clone(),
-                    None,
-                )
-                .await?
-                .relay_url,
-        };
-        Ok(ohttp_relay)
-    }
-
     /// Handle error by attempting to send an error response over the directory
     async fn handle_error(
         &self,
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (err_req, err_ctx) = session
-            .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
-
-        let err_response = match self.post_request(err_req).await {
-            Ok(response) => response,
-            Err(e) => return Err(anyhow!("Failed to post error request: {}", e)),
-        };
+        let relay_manager = Self::new_relay_manager();
+        let session_socks_auth = self.receiver_socks_auth(persister)?;
+        let (err_response, err_ctx) = post_v2_request_with_relay_failover(
+            &self.config,
+            relay_manager,
+            None,
+            session_socks_auth.as_ref(),
+            |relay| session.create_error_request(relay.as_str()),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to post error request: {}", e))?;
 
         let err_bytes = match err_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1002,33 +1050,119 @@ impl App {
 
         Ok(())
     }
-
-    async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
-        let http = http_agent(&self.config)?;
-        http.post(req.url)
-            .header("Content-Type", req.content_type)
-            .body(req.body)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .context("HTTP request failed")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     use payjoin::bitcoin::bech32::primitives::decode::CheckedHrpstring;
     use payjoin::bitcoin::bech32::NoChecksum;
     use payjoin::bitcoin::{Address, Network};
     use payjoin::persist::NoopSessionPersister;
     use payjoin::receive::v2::ReceiverBuilder;
+    use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::task;
 
     use super::*;
     use crate::app::config::{BitcoindConfig, V2Config, VersionConfig};
+    use crate::db::v2::ReceiverPersister;
+    use crate::db::Database;
+
+    #[test]
+    fn close_failed_receiver_init_closes_session() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let db = Arc::new(
+            Database::create(temp_dir.path().join("payjoin.sqlite"))
+                .expect("database should initialize"),
+        );
+        let persister =
+            ReceiverPersister::new(db.clone()).expect("receiver session should initialize");
+
+        let err =
+            App::close_failed_receiver_init::<(), anyhow::Error>(Err(anyhow!("boom")), &persister)
+                .expect_err("failing receiver init should propagate an error");
+
+        assert!(err.to_string().contains("boom"));
+        assert!(
+            db.get_recv_session_ids().expect("active sessions should load").is_empty(),
+            "failed receiver init should not leave an active session behind"
+        );
+        let inactive = db.get_inactive_recv_session_ids().expect("inactive sessions should load");
+        assert_eq!(inactive.len(), 1, "failed receiver init should close the session");
+        assert_eq!(
+            inactive[0].0.to_string(),
+            persister.session_id().to_string(),
+            "the receiver session created for initialization should be the one that was closed"
+        );
+    }
+
+    #[test]
+    fn close_failed_receiver_init_preserves_successful_session() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let db = Arc::new(
+            Database::create(temp_dir.path().join("payjoin.sqlite"))
+                .expect("database should initialize"),
+        );
+        let persister =
+            ReceiverPersister::new(db.clone()).expect("receiver session should initialize");
+
+        let value = App::close_failed_receiver_init(Ok::<_, anyhow::Error>(7_u8), &persister)
+            .expect("successful receiver init should pass through");
+
+        assert_eq!(value, 7);
+        assert_eq!(
+            db.get_recv_session_ids().expect("active sessions should load").len(),
+            1,
+            "successful receiver init should keep the session active"
+        );
+        assert!(
+            db.get_inactive_recv_session_ids().expect("inactive sessions should load").is_empty(),
+            "successful receiver init should not close the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_resume_tasks_propagates_task_errors() {
+        let err = await_resume_tasks(vec![task::spawn(async { Err(anyhow!("boom")) })])
+            .await
+            .expect_err("failing resumed session task should propagate");
+
+        assert!(
+            err.to_string().contains("boom"),
+            "resume helper should preserve the inner task error"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_resume_tasks_awaits_remaining_tasks_after_error() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_task = Arc::clone(&completed);
+
+        let err = await_resume_tasks(vec![
+            task::spawn(async { Err(anyhow!("boom")) }),
+            task::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                completed_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        ])
+        .await
+        .expect_err("resume helper should report the first task error");
+
+        assert!(
+            err.to_string().contains("boom"),
+            "resume helper should preserve the first inner task error"
+        );
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "resume helper should await remaining tasks before returning the first error"
+        );
+    }
 
     #[test]
     fn is_socks_proxy_error_detects_tokio_socks_in_chain() {
