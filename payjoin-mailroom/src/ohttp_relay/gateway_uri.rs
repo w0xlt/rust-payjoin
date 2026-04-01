@@ -66,6 +66,16 @@ impl GatewayUri {
             .expect("building RFC 9540 uri from scheme and authority must succeed")
     }
 
+    pub fn host(&self) -> &str { self.authority.host() }
+
+    pub fn port(&self) -> u16 {
+        self.authority
+            .port_u16()
+            .expect("default port should already be normalized into the authority")
+    }
+
+    pub fn scheme_str(&self) -> &str { self.scheme.as_str() }
+
     pub async fn to_socket_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
         Ok(self.to_socket_addrs().await?.next())
     }
