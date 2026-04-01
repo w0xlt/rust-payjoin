@@ -76,6 +76,15 @@ pub struct Cli {
     #[arg(long = "pj-directory", help = "The directory to store payjoin requests", value_parser = value_parser!(Url))]
     pub pj_directory: Option<Url>,
 
+    #[cfg(feature = "v2")]
+    #[arg(
+        long = "socks-proxy",
+        help = "SOCKS5h proxy URL for BIP77 relay traffic",
+        value_parser = value_parser!(Url),
+        global = true
+    )]
+    pub socks_proxy: Option<Url>,
+
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
     pub root_certificate: Option<PathBuf>,
@@ -143,4 +152,49 @@ pub fn parse_fee_rate_in_sat_per_vb(s: &str) -> Result<FeeRate, std::num::ParseF
     let fee_rate_sat_per_vb: f32 = s.parse()?;
     let fee_rate_sat_per_kwu = fee_rate_sat_per_vb * 250.0_f32;
     Ok(FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu.ceil() as u64))
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn receive_accepts_socks_proxy_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "receive",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "1000",
+        ])
+        .expect("receive subcommand should accept global SOCKS proxy flag");
+
+        assert_eq!(
+            cli.socks_proxy.as_ref().map(url::Url::as_str),
+            Some("socks5h://127.0.0.1:9050")
+        );
+        assert!(matches!(cli.command, Commands::Receive { .. }));
+    }
+
+    #[test]
+    fn send_accepts_socks_proxy_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "send",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "bitcoin:tb1qexample?amount=0.001",
+            "--fee-rate",
+            "1",
+        ])
+        .expect("send subcommand should accept global SOCKS proxy flag");
+
+        assert_eq!(
+            cli.socks_proxy.as_ref().map(url::Url::as_str),
+            Some("socks5h://127.0.0.1:9050")
+        );
+        assert!(matches!(cli.command, Commands::Send { .. }));
+    }
 }
