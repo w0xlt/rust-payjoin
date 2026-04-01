@@ -109,8 +109,7 @@ fn http_agent_with_socks(_config: &Config, socks_proxy: &Url) -> Result<reqwest:
 }
 
 #[cfg(feature = "v2")]
-#[allow(dead_code)]
-fn isolated_socks_proxy_url(socks_proxy: &Url) -> Result<Url> {
+pub(crate) fn isolated_socks_proxy_url(socks_proxy: &Url) -> Result<Url> {
     use payjoin::bitcoin::key::rand::Rng;
 
     if !socks_proxy.username().is_empty() || socks_proxy.password().is_some() {

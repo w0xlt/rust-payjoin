@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 
+use super::bootstrap::fetch_ohttp_keys_via_relay_tunnel;
 use super::Config;
 
 #[derive(Debug, Clone)]
@@ -76,36 +77,48 @@ async fn fetch_ohttp_keys(
             .set_selected_relay(selected_relay.clone());
 
         let ohttp_keys = {
-            #[cfg(feature = "_manual-tls")]
-            {
-                if let Some(cert_path) = config.root_certificate.as_ref() {
-                    let cert_der = std::fs::read(cert_path)?;
-                    payjoin::io::fetch_ohttp_keys_with_cert(
-                        selected_relay.as_str(),
-                        payjoin_directory.as_str(),
-                        &cert_der,
-                    )
+            if config.v2()?.socks_proxy.is_some() {
+                fetch_ohttp_keys_via_relay_tunnel(config, &selected_relay, &payjoin_directory)
                     .await
-                } else {
+            } else {
+                #[cfg(feature = "_manual-tls")]
+                {
+                    if let Some(cert_path) = config.root_certificate.as_ref() {
+                        let cert_der = std::fs::read(cert_path)?;
+                        payjoin::io::fetch_ohttp_keys_with_cert(
+                            selected_relay.as_str(),
+                            payjoin_directory.as_str(),
+                            &cert_der,
+                        )
+                        .await
+                    } else {
+                        payjoin::io::fetch_ohttp_keys(
+                            selected_relay.as_str(),
+                            payjoin_directory.as_str(),
+                        )
+                        .await
+                    }
+                }
+                #[cfg(not(feature = "_manual-tls"))]
                     payjoin::io::fetch_ohttp_keys(
                         selected_relay.as_str(),
                         payjoin_directory.as_str(),
                     )
                     .await
-                }
+                    .map_err(anyhow::Error::from)
             }
-            #[cfg(not(feature = "_manual-tls"))]
-            payjoin::io::fetch_ohttp_keys(selected_relay.as_str(), payjoin_directory.as_str()).await
         };
 
         match ohttp_keys {
             Ok(keys) =>
                 return Ok(ValidatedOhttpKeys { ohttp_keys: keys, relay_url: selected_relay }),
-            Err(payjoin::io::Error::UnexpectedStatusCode(e)) => {
-                return Err(payjoin::io::Error::UnexpectedStatusCode(e).into());
-            }
-            Err(e) => {
-                tracing::debug!("Failed to connect to relay: {selected_relay}, {e:?}");
+            Err(err) => {
+                if let Some(payjoin::io::Error::UnexpectedStatusCode(code)) =
+                    err.downcast_ref::<payjoin::io::Error>()
+                {
+                    return Err(payjoin::io::Error::UnexpectedStatusCode(*code).into());
+                }
+                tracing::debug!("Failed to connect to relay: {selected_relay}, {err:?}");
                 relay_manager
                     .lock()
                     .expect("Lock should not be poisoned")
