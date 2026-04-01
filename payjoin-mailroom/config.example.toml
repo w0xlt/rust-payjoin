@@ -13,6 +13,12 @@
 # Request timeout in seconds
 # timeout = 30
 
+# Optional SOCKS5h proxy for outbound relay traffic.
+# This routes the mailroom's connections to remote OHTTP gateways through Tor
+# or another SOCKS proxy. Use a socks5h:// URL to keep DNS resolution on the
+# proxy side.
+# outbound_socks_proxy = "socks5h://127.0.0.1:9050"
+
 # --- Telemetry (requires `telemetry` feature) ---
 # [telemetry]
 
