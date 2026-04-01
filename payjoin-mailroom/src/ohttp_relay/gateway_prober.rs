@@ -1,6 +1,5 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
-use std::error::Error;
 use std::io::{ErrorKind, Read};
 use std::time::Duration;
 
@@ -8,7 +7,6 @@ use byteorder::{BigEndian, ReadBytesExt};
 use bytes::BytesMut;
 use futures::future::{self, FutureExt};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
 use tokio::sync::{oneshot, RwLock};
 use tokio::time::Instant;
 
@@ -218,20 +216,14 @@ impl Prober {
         })
     }
 
-    async fn is_explicit_opt_in(res: &mut hyper::Response<Incoming>) -> Option<()> {
-        if res.status() != hyper::StatusCode::OK {
+    async fn is_explicit_opt_in(res: &super::HttpResponse) -> Option<()> {
+        if res.status != hyper::StatusCode::OK {
             return None;
         }
 
-        let mut body = BytesMut::new();
-        while let Some(next) = res.frame().await {
-            let frame = next.ok()?;
-            if let Some(chunk) = frame.data_ref() {
-                body.extend_from_slice(chunk)
-            }
-        }
+        let body = BytesMut::from(res.body.as_ref());
 
-        if res.headers().get(hyper::header::CONTENT_TYPE)?
+        if res.headers.get(hyper::header::CONTENT_TYPE)?
             != hyper::header::HeaderValue::from_static(ALLOWED_PURPOSES_CONTENT_TYPE)
         {
             return None;
@@ -269,7 +261,7 @@ impl Prober {
         let ttl = match &mut res {
             Ok(res) => {
                 // TODO handle Cache-Control
-                let status = res.status();
+                let status = res.status;
 
                 if status.is_success() {
                     bip77_allowed = Self::is_explicit_opt_in(res).await.is_some();

@@ -7,20 +7,21 @@ use std::task::{Context, Poll};
 pub(crate) use gateway_prober::Prober;
 pub use gateway_uri::GatewayUri;
 use http::uri::Authority;
+use http::HeaderMap;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::Bytes;
 use hyper::header::{
     HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LENGTH, CONTENT_TYPE,
 };
 use hyper::{Method, Request, Response};
-use hyper_rustls::builderstates::WantsSchemes;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::instrument;
+use url::Url;
 
 pub mod error;
 mod gateway_prober;
@@ -40,23 +41,15 @@ pub const DEFAULT_GATEWAY: &str = "https://payjo.in";
 struct RelayConfig {
     default_gateway: GatewayUri,
     client: HttpClient,
+    connector: GatewayConnector,
     prober: Prober,
     sentinel_tag: SentinelTag,
 }
 
 impl RelayConfig {
-    fn new_with_default_client(default_gateway: GatewayUri, sentinel_tag: SentinelTag) -> Self {
-        Self::new(default_gateway, HttpClient::default(), sentinel_tag)
-    }
-
-    fn new(
-        default_gateway: GatewayUri,
-        into_client: impl Into<HttpClient>,
-        sentinel_tag: SentinelTag,
-    ) -> Self {
-        let client = into_client.into();
+    fn new(default_gateway: GatewayUri, client: HttpClient, connector: GatewayConnector, sentinel_tag: SentinelTag) -> Self {
         let prober = Prober::new_with_client(client.clone());
-        RelayConfig { default_gateway, client, prober, sentinel_tag }
+        RelayConfig { default_gateway, client, connector, prober, sentinel_tag }
     }
 }
 
@@ -66,15 +59,21 @@ pub struct Service {
 }
 
 impl Service {
-    pub async fn new(sentinel_tag: SentinelTag) -> Self {
+    pub async fn new(
+        sentinel_tag: SentinelTag,
+        outbound_socks_proxy: Option<url::Url>,
+    ) -> anyhow::Result<Self> {
         // The default gateway is hardcoded because it is obsolete and required only for backwards
         // compatibility.
         // The new mechanism for specifying a custom gateway is via RFC 9540 using
         // `/.well-known/ohttp-gateway` request paths.
         let gateway_origin = GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri");
-        let config = RelayConfig::new_with_default_client(gateway_origin, sentinel_tag);
+        let socks_proxy = SocksProxyConfig::parse(outbound_socks_proxy)?;
+        let connector = GatewayConnector::new(socks_proxy.clone());
+        let client = HttpClient::new(socks_proxy, None)?;
+        let config = RelayConfig::new(gateway_origin, client, connector, sentinel_tag);
         config.prober.assert_opt_in(&config.default_gateway).await;
-        Self { config: Arc::new(config) }
+        Ok(Self { config: Arc::new(config) })
     }
 
     #[cfg(feature = "_manual-tls")]
@@ -82,12 +81,16 @@ impl Service {
         sentinel_tag: SentinelTag,
         root_store: rustls::RootCertStore,
         default_gateway: Option<GatewayUri>,
-    ) -> Self {
+        outbound_socks_proxy: Option<url::Url>,
+    ) -> anyhow::Result<Self> {
         let gateway_origin = default_gateway
             .unwrap_or_else(|| GatewayUri::from_str(DEFAULT_GATEWAY).expect("valid gateway uri"));
-        let config = RelayConfig::new(gateway_origin, root_store, sentinel_tag);
+        let socks_proxy = SocksProxyConfig::parse(outbound_socks_proxy)?;
+        let connector = GatewayConnector::new(socks_proxy.clone());
+        let client = HttpClient::new(socks_proxy, Some(root_store))?;
+        let config = RelayConfig::new(gateway_origin, client, connector, sentinel_tag);
         config.prober.assert_opt_in(&config.default_gateway).await;
-        Self { config: Arc::new(config) }
+        Ok(Self { config: Arc::new(config) })
     }
 }
 
@@ -112,38 +115,163 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct HttpClient(
-    hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, hyper::Error>>,
-);
-
-impl std::ops::Deref for HttpClient {
-    type Target = hyper_util::client::legacy::Client<
-        HttpsConnector<HttpConnector>,
-        BoxBody<Bytes, hyper::Error>,
-    >;
-    fn deref(&self) -> &Self::Target { &self.0 }
+struct SocksProxyConfig {
+    url: Url,
 }
 
-impl From<HttpsConnectorBuilder<WantsSchemes>> for HttpClient {
-    fn from(builder: HttpsConnectorBuilder<WantsSchemes>) -> Self {
-        let https = builder.https_or_http().enable_http1().build();
-        Self(Client::builder(TokioExecutor::new()).build(https))
+impl SocksProxyConfig {
+    fn parse(url: Option<Url>) -> anyhow::Result<Option<Self>> {
+        match url {
+            Some(url) => {
+                if url.scheme() != "socks5h" {
+                    anyhow::bail!("mailroom outbound SOCKS proxy must use the socks5h:// scheme");
+                }
+                Ok(Some(Self { url }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn reqwest_proxy(&self) -> Result<reqwest::Proxy, reqwest::Error> {
+        reqwest::Proxy::all(self.url.as_str())
+    }
+
+    async fn connect(&self, gateway: &GatewayUri) -> std::io::Result<tokio::net::TcpStream> {
+        let proxy_host =
+            self.url.host_str().ok_or_else(|| std::io::Error::other("missing SOCKS proxy host"))?;
+        let proxy_port = self
+            .url
+            .port_or_known_default()
+            .ok_or_else(|| std::io::Error::other("missing SOCKS proxy port"))?;
+
+            let stream = if !self.url.username().is_empty() || self.url.password().is_some() {
+                tokio_socks::tcp::Socks5Stream::connect_with_password(
+                    (proxy_host, proxy_port),
+                    (gateway.host(), gateway.port()),
+                    self.url.username(),
+                    self.url.password().unwrap_or(""),
+                )
+                .await
+                .map_err(std::io::Error::other)?
+            } else {
+                tokio_socks::tcp::Socks5Stream::connect(
+                    (proxy_host, proxy_port),
+                    (gateway.host(), gateway.port()),
+                )
+                .await
+                .map_err(std::io::Error::other)?
+            };
+            Ok(stream.into_inner())
+        }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayConnector {
+    socks_proxy: Option<SocksProxyConfig>,
+}
+
+impl GatewayConnector {
+    fn new(socks_proxy: Option<SocksProxyConfig>) -> Self { Self { socks_proxy } }
+
+    fn requires_plain_http(&self) -> bool { self.socks_proxy.is_some() }
+
+    async fn connect(&self, gateway: &GatewayUri) -> std::io::Result<tokio::net::TcpStream> {
+        match &self.socks_proxy {
+            Some(socks_proxy) => socks_proxy.connect(gateway).await,
+            None => {
+                let addr = gateway
+                    .to_socket_addr()
+                    .await?
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+                tokio::net::TcpStream::connect(addr).await
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HttpResponse {
+    pub(crate) status: hyper::StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HttpClient {
+    Direct(
+        hyper_util::client::legacy::Client<
+            HttpsConnector<HttpConnector>,
+            BoxBody<Bytes, hyper::Error>,
+        >,
+    ),
+    Socks(reqwest::Client),
+}
+
+impl HttpClient {
+    fn new(
+        socks_proxy: Option<SocksProxyConfig>,
+        #[cfg(feature = "_manual-tls")] root_store: Option<rustls::RootCertStore>,
+        #[cfg(not(feature = "_manual-tls"))] _root_store: Option<()>,
+    ) -> anyhow::Result<Self> {
+        if let Some(socks_proxy) = socks_proxy {
+            let builder = reqwest::Client::builder().proxy(socks_proxy.reqwest_proxy()?).http1_only();
+            Ok(Self::Socks(builder.build()?))
+        } else {
+            #[cfg(feature = "_manual-tls")]
+            if let Some(root_store) = root_store {
+                let https = HttpsConnectorBuilder::new()
+                    .with_tls_config(
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth(),
+                    )
+                    .https_or_http()
+                    .enable_http1()
+                    .build();
+                return Ok(Self::Direct(Client::builder(TokioExecutor::new()).build(https)));
+            }
+
+            let https = HttpsConnectorBuilder::new().with_webpki_roots().https_or_http().enable_http1().build();
+            Ok(Self::Direct(Client::builder(TokioExecutor::new()).build(https)))
+        }
+    }
+
+    pub(crate) async fn request(
+        &self,
+        req: Request<BoxBody<Bytes, hyper::Error>>,
+    ) -> Result<HttpResponse, BoxError> {
+        match self {
+            Self::Direct(client) => {
+                let response = client.request(req).await?;
+                let (parts, body) = response.into_parts();
+                let body = body.collect().await?.to_bytes();
+                Ok(HttpResponse { status: parts.status, headers: parts.headers, body })
+            }
+            Self::Socks(client) => {
+                let (parts, body) = req.into_parts();
+                let body = body.collect().await?.to_bytes();
+                let mut builder = client.request(parts.method, parts.uri.to_string()).body(body);
+                for (name, value) in &parts.headers {
+                    builder = builder.header(name, value);
+                }
+                let response = builder.send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await?;
+                Ok(HttpResponse { status, headers, body })
+            }
+        }
     }
 }
 
 impl Default for HttpClient {
-    fn default() -> Self { HttpsConnectorBuilder::new().with_webpki_roots().into() }
-}
-
-impl From<rustls::RootCertStore> for HttpClient {
-    fn from(root_store: rustls::RootCertStore) -> Self {
-        HttpsConnectorBuilder::new()
-            .with_tls_config(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
-            .into()
+    fn default() -> Self {
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        Self::Direct(Client::builder(TokioExecutor::new()).build(https))
     }
 }
 
@@ -171,7 +299,12 @@ where
         (&Method::GET, _) | (&Method::CONNECT, _) => {
             match parse_gateway_uri(&method, path, authority, config).await {
                 Ok(gateway_uri) =>
-                    crate::ohttp_relay::bootstrap::handle_ohttp_keys(req, gateway_uri).await,
+                    crate::ohttp_relay::bootstrap::handle_ohttp_keys(
+                        req,
+                        gateway_uri,
+                        config.connector.clone(),
+                    )
+                    .await,
                 Err(e) => Err(e),
             }
         }
@@ -195,6 +328,12 @@ async fn parse_gateway_uri(
         _ => parse_gateway_uri_from_path(path, &config.default_gateway).ok(),
     }
     .ok_or_else(|| Error::BadRequest("Invalid gateway".to_string()))?;
+
+    if config.connector.requires_plain_http() && gateway_uri.scheme_str() != "http" {
+        return Err(Error::BadRequest(
+            "SOCKS relay mode currently requires http:// gateway URLs".to_string(),
+        ));
+    }
 
     let policy = match config.prober.check_opt_in(&gateway_uri).await {
         Some(policy) => Ok(policy),
@@ -255,12 +394,7 @@ where
     B::Error: Into<BoxError>,
 {
     let fwd_req = into_forward_req(req, gateway, &config.sentinel_tag).await?;
-
-    forward_request(fwd_req, config).await.map(|res| {
-        let (parts, body) = res.into_parts();
-        let boxed_body = BoxBody::new(body);
-        Response::from_parts(parts, boxed_body)
-    })
+    forward_request(fwd_req, config).await
 }
 
 /// Convert an incoming request into a request to forward to the target gateway server.
@@ -305,8 +439,15 @@ where
 async fn forward_request(
     req: Request<BoxBody<Bytes, hyper::Error>>,
     config: &RelayConfig,
-) -> Result<Response<Incoming>, Error> {
-    config.client.request(req).await.map_err(|_| Error::BadGateway)
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Error> {
+    let response = config.client.request(req).await.map_err(|_| Error::BadGateway)?;
+    let mut builder = Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(full(response.body))
+        .map_err(|e| Error::InternalServerError(Box::new(e)))
 }
 
 pub(crate) fn empty() -> BoxBody<Bytes, hyper::Error> {
@@ -315,4 +456,57 @@ pub(crate) fn empty() -> BoxBody<Bytes, hyper::Error> {
 
 pub(crate) fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into()).map_err(|never| match never {}).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use hyper::Method;
+    use url::Url;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn service_rejects_non_socks5h_outbound_proxy() {
+        let result = Service::new(
+            SentinelTag::new([0u8; 32]),
+            Some(Url::parse("http://127.0.0.1:9050").expect("static URL is valid")),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("non-socks5h proxy should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("socks5h://"),
+            "error should explain the required SOCKS scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_gateway_uri_rejects_https_gateway_in_socks_mode() {
+        let socks_proxy =
+            SocksProxyConfig::parse(Some(Url::parse("socks5h://127.0.0.1:9050").unwrap()))
+                .expect("SOCKS proxy should parse");
+        let config = RelayConfig::new(
+            GatewayUri::from_str(DEFAULT_GATEWAY).expect("default gateway is valid"),
+            HttpClient::new(socks_proxy.clone(), None).expect("SOCKS client should build"),
+            GatewayConnector::new(socks_proxy),
+            SentinelTag::new([0u8; 32]),
+        );
+
+        let err = parse_gateway_uri(
+            &Method::GET,
+            "/https://directory.example/",
+            None,
+            &config,
+        )
+        .await
+        .expect_err("https gateway should be rejected in SOCKS relay mode");
+        assert!(
+            matches!(err, Error::BadRequest(_)),
+            "SOCKS relay mode should reject https gateways before probing"
+        );
+    }
 }
