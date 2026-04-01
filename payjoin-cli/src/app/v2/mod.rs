@@ -23,7 +23,7 @@ use super::config::Config;
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
 use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
-use crate::app::{handle_interrupt, http_agent};
+use crate::app::{handle_interrupt, http_agent, v2_http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
@@ -503,7 +503,7 @@ impl App {
         let (req, ctx) = sender.create_v2_post_request(
             self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?.as_str(),
         )?;
-        let response = self.post_request(req).await?;
+        let response = self.post_v2_request(req).await?;
         println!("Posted original proposal...");
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
         self.get_proposed_payjoin_psbt(sender, persister).await
@@ -519,7 +519,7 @@ impl App {
         // Long poll until we get a response
         loop {
             let (req, ctx) = session.create_poll_request(ohttp_relay.as_str())?;
-            let response = self.post_request(req).await?;
+            let response = self.post_v2_request(req).await?;
             let res = session.process_response(&response.bytes().await?, ctx).save(persister);
             match res {
                 Ok(OptionalTransitionOutcome::Progress(psbt)) => {
@@ -856,6 +856,16 @@ impl App {
 
     async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
         let http = http_agent(&self.config)?;
+        http.post(req.url)
+            .header("Content-Type", req.content_type)
+            .body(req.body)
+            .send()
+            .await
+            .map_err(map_reqwest_err)
+    }
+
+    async fn post_v2_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
+        let http = v2_http_agent(&self.config)?;
         http.post(req.url)
             .header("Content-Type", req.content_type)
             .body(req.body)
