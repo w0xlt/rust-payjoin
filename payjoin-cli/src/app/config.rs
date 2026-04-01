@@ -30,12 +30,55 @@ pub struct V1Config {
 }
 
 #[cfg(feature = "v2")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct V2Config {
     #[serde(deserialize_with = "deserialize_ohttp_keys_from_path")]
     pub ohttp_keys: Option<payjoin::OhttpKeys>,
     pub ohttp_relays: Vec<Url>,
     pub pj_directory: Url,
+    pub socks_proxy: Option<Url>,
+}
+
+#[cfg(feature = "v2")]
+impl std::fmt::Debug for V2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("V2Config")
+            .field("ohttp_keys", &self.ohttp_keys)
+            .field("ohttp_relays", &self.ohttp_relays)
+            .field("pj_directory", &self.pj_directory)
+            .field("socks_proxy", &self.socks_proxy.as_ref().map(redact_url_userinfo))
+            .finish()
+    }
+}
+
+#[cfg(feature = "v2")]
+fn redact_url_userinfo(url: &Url) -> String {
+    match reqwest::Url::parse(url.as_str()) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("redacted");
+            }
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("redacted"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => url.as_str().to_string(),
+    }
+}
+
+#[cfg(feature = "v2")]
+impl V2Config {
+    fn validate(self) -> Result<Self, ConfigError> {
+        if let Some(socks_proxy) = &self.socks_proxy {
+            if socks_proxy.scheme() != "socks5h" {
+                return Err(ConfigError::Message(
+                    "BIP77 SOCKS proxy must use the socks5h:// scheme".to_owned(),
+                ));
+            }
+        }
+        Ok(self)
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -179,7 +222,7 @@ impl Config {
                 #[cfg(feature = "v2")]
                 {
                     match built_config.get::<V2Config>("v2") {
-                        Ok(v2) => config.version = Some(VersionConfig::V2(v2)),
+                        Ok(v2) => config.version = Some(VersionConfig::V2(v2.validate()?)),
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V2 configuration is required for BIP77 mode: {e}"
@@ -270,11 +313,13 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     // Set default values
     let config = config
         .set_default("v2.pj_directory", "https://payjo.in")?
-        .set_default("v2.ohttp_keys", None::<String>)?;
+        .set_default("v2.ohttp_keys", None::<String>)?
+        .set_default("v2.socks_proxy", None::<String>)?;
 
     // Override config values with command line arguments if applicable
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let socks_proxy = cli.socks_proxy.as_ref().map(|url| url.as_str());
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
@@ -283,6 +328,7 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     config
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
+        .set_override_option("v2.socks_proxy", socks_proxy)?
         .set_override_option("v2.ohttp_relays", ohttp_relays)
 }
 
@@ -358,5 +404,69 @@ where
                 })
             })
             .map(Some),
+    }
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use super::V2Config;
+
+    #[test]
+    fn v2_config_accepts_socks5h_proxy() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("http://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("http://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                payjoin::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+        };
+
+        assert!(config.validate().is_ok(), "socks5h proxy should be accepted");
+    }
+
+    #[test]
+    fn v2_config_rejects_non_socks5h_proxy() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("http://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("http://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                payjoin::Url::parse("socks5://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+        };
+
+        let err = config.validate().expect_err("non-socks5h proxy should be rejected");
+        assert!(
+            err.to_string().contains("socks5h://"),
+            "validation error should explain the required scheme"
+        );
+    }
+
+    #[test]
+    fn v2_config_debug_redacts_socks_proxy_credentials() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("http://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("http://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                payjoin::Url::parse("socks5h://secretuser:secretpass@127.0.0.1:9050")
+                    .expect("static URL is valid"),
+            ),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("secretuser"), "username must not appear in Debug output");
+        assert!(!rendered.contains("secretpass"), "password must not appear in Debug output");
+        assert!(rendered.contains("redacted"), "redaction marker should appear in Debug output");
     }
 }

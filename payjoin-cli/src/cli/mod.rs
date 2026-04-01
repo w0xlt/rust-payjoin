@@ -76,6 +76,15 @@ pub struct Cli {
     #[arg(long = "pj-directory", help = "The directory to store payjoin requests", value_parser = value_parser!(Url))]
     pub pj_directory: Option<Url>,
 
+    #[cfg(feature = "v2")]
+    #[arg(
+        long = "socks-proxy",
+        help = "SOCKS5h proxy URL for BIP77 relay traffic",
+        value_parser = value_parser!(Url),
+        global = true
+    )]
+    pub socks_proxy: Option<Url>,
+
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
     pub root_certificate: Option<PathBuf>,
@@ -147,4 +156,50 @@ pub fn parse_fee_rate_in_sat_per_vb(s: &str) -> Result<FeeRate, std::num::ParseF
 
 fn parse_boxed_url(s: &str) -> Result<Box<Url>, String> {
     s.parse::<Url>().map(Box::new).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn receive_accepts_socks_proxy_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "receive",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "1000",
+        ])
+        .expect("receive subcommand should accept global SOCKS proxy flag");
+
+        assert_socks_proxy_endpoint(cli.socks_proxy.as_ref());
+        assert!(matches!(cli.command, Commands::Receive { .. }));
+    }
+
+    #[test]
+    fn send_accepts_socks_proxy_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "send",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "bitcoin:tb1qexample?amount=0.001",
+            "--fee-rate",
+            "1",
+        ])
+        .expect("send subcommand should accept global SOCKS proxy flag");
+
+        assert_socks_proxy_endpoint(cli.socks_proxy.as_ref());
+        assert!(matches!(cli.command, Commands::Send { .. }));
+    }
+
+    fn assert_socks_proxy_endpoint(socks_proxy: Option<&payjoin::Url>) {
+        let socks_proxy = socks_proxy.expect("SOCKS proxy should be parsed");
+        assert_eq!(socks_proxy.scheme(), "socks5h");
+        assert_eq!(socks_proxy.host_str(), "127.0.0.1");
+        assert_eq!(socks_proxy.port(), Some(9050));
+    }
 }
