@@ -80,10 +80,21 @@ pub struct Cli {
     #[arg(
         long = "socks-proxy",
         help = "SOCKS5h proxy URL for BIP77 relay traffic",
-        value_parser = value_parser!(Url),
+        value_parser = value_parser!(url::Url),
         global = true
     )]
-    pub socks_proxy: Option<Url>,
+    pub socks_proxy: Option<url::Url>,
+
+    #[cfg(feature = "v2")]
+    #[arg(
+        long = "tor-stream-isolation",
+        help = "Request Tor stream isolation by generating per-session SOCKS credentials",
+        action = clap::ArgAction::Set,
+        num_args(0),
+        default_missing_value = "true",
+        global = true
+    )]
+    pub tor_stream_isolation: Option<bool>,
 
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
@@ -196,10 +207,41 @@ mod tests {
         assert!(matches!(cli.command, Commands::Send { .. }));
     }
 
-    fn assert_socks_proxy_endpoint(socks_proxy: Option<&payjoin::Url>) {
+    #[test]
+    fn receive_accepts_tor_stream_isolation_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "receive",
+            "--tor-stream-isolation",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "1000",
+        ])
+        .expect("receive subcommand should accept global Tor stream isolation flag");
+
+        assert_eq!(cli.tor_stream_isolation, Some(true));
+        assert_socks_proxy_endpoint(cli.socks_proxy.as_ref());
+        assert!(matches!(cli.command, Commands::Receive { .. }));
+    }
+
+    #[test]
+    fn omitted_tor_stream_isolation_remains_unset() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "receive",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "1000",
+        ])
+        .expect("receive subcommand should parse without Tor stream isolation flag");
+
+        assert_eq!(cli.tor_stream_isolation, None);
+    }
+
+    fn assert_socks_proxy_endpoint(socks_proxy: Option<&url::Url>) {
         let socks_proxy = socks_proxy.expect("SOCKS proxy should be parsed");
         assert_eq!(socks_proxy.scheme(), "socks5h");
-        assert_eq!(socks_proxy.host_str(), "127.0.0.1");
+        assert_eq!(socks_proxy.host_str(), Some("127.0.0.1"));
         assert_eq!(socks_proxy.port(), Some(9050));
     }
 }

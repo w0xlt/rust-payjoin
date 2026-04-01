@@ -2789,23 +2789,30 @@ dependencies = [
  "clap 4.6.0",
  "config",
  "dirs",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "nix 0.30.1",
  "payjoin",
  "payjoin-test-utils",
+ "percent-encoding",
  "r2d2",
  "r2d2_sqlite",
  "reqwest",
  "rusqlite",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-socks",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -4396,6 +4403,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-socks"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d4770b8024672c1101b3f6733eab95b18007dbe0847a8afe341fcf79e06043f"
+dependencies = [
+ "either",
+ "futures-util",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4980,6 +4999,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

@@ -11,6 +11,24 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(crate) struct SessionId(i64);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SocksAuth {
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
+
+impl SocksAuth {
+    pub(crate) fn generate() -> Self {
+        use payjoin::bitcoin::key::rand::Rng;
+
+        let mut rng = payjoin::bitcoin::key::rand::thread_rng();
+        Self {
+            username: format!("{:032x}", rng.gen::<u128>()),
+            password: format!("{:032x}", rng.gen::<u128>()),
+        }
+    }
+}
+
 impl core::ops::Deref for SessionId {
     type Target = i64;
     fn deref(&self) -> &Self::Target { &self.0 }
@@ -61,6 +79,11 @@ impl SenderPersister {
     }
 
     pub fn from_id(db: Arc<Database>, id: SessionId) -> Self { Self { db, session_id: id } }
+
+    #[allow(dead_code)]
+    pub fn get_or_create_socks_auth(&self) -> crate::db::Result<SocksAuth> {
+        self.db.get_or_create_send_session_socks_auth(&self.session_id)
+    }
 }
 impl SessionPersister for SenderPersister {
     type SessionEvent = SenderSessionEvent;
@@ -139,6 +162,13 @@ impl ReceiverPersister {
     }
 
     pub fn from_id(db: Arc<Database>, id: SessionId) -> Self { Self { db, session_id: id } }
+
+    #[allow(dead_code)]
+    pub fn session_id(&self) -> &SessionId { &self.session_id }
+
+    pub fn get_or_create_socks_auth(&self) -> crate::db::Result<SocksAuth> {
+        self.db.get_or_create_receive_session_socks_auth(&self.session_id)
+    }
 }
 
 impl SessionPersister for ReceiverPersister {
@@ -200,6 +230,73 @@ impl SessionPersister for ReceiverPersister {
 }
 
 impl Database {
+    fn get_session_socks_auth(
+        &self,
+        table: &str,
+        session_id: &SessionId,
+    ) -> Result<Option<SocksAuth>> {
+        let conn = self.get_connection()?;
+        Self::get_session_socks_auth_from_conn(&conn, table, session_id)
+    }
+
+    fn get_session_socks_auth_from_conn(
+        conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+        table: &str,
+        session_id: &SessionId,
+    ) -> Result<Option<SocksAuth>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT socks_username, socks_password FROM {table} WHERE session_id = ?1"
+        ))?;
+        let (username, password): (Option<String>, Option<String>) =
+            stmt.query_row(params![session_id.0], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        match (username, password) {
+            (Some(username), Some(password)) => Ok(Some(SocksAuth { username, password })),
+            (None, None) => Ok(None),
+            _ => Err(rusqlite::Error::InvalidQuery.into()),
+        }
+    }
+
+    fn get_or_create_session_socks_auth(
+        &self,
+        table: &str,
+        session_id: &SessionId,
+    ) -> Result<SocksAuth> {
+        if let Some(existing_auth) = self.get_session_socks_auth(table, session_id)? {
+            return Ok(existing_auth);
+        }
+
+        let conn = self.get_connection()?;
+        let generated_auth = SocksAuth::generate();
+        conn.execute(
+            &format!(
+                "UPDATE {table}
+                 SET socks_username = COALESCE(socks_username, ?1),
+                     socks_password = COALESCE(socks_password, ?2)
+                 WHERE session_id = ?3"
+            ),
+            params![generated_auth.username, generated_auth.password, session_id.0],
+        )?;
+
+        Self::get_session_socks_auth_from_conn(&conn, table, session_id)?
+            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows.into())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_or_create_send_session_socks_auth(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SocksAuth> {
+        self.get_or_create_session_socks_auth("send_sessions", session_id)
+    }
+
+    pub(crate) fn get_or_create_receive_session_socks_auth(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SocksAuth> {
+        self.get_or_create_session_socks_auth("receive_sessions", session_id)
+    }
+
     pub(crate) fn get_recv_session_ids(&self) -> Result<Vec<SessionId>> {
         let conn = self.get_connection()?;
         let mut stmt =
@@ -293,6 +390,7 @@ mod tests {
     use std::sync::Arc;
 
     use payjoin::HpkeKeyPair;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -365,5 +463,43 @@ mod tests {
             matches!(err, Error::DuplicateSendSession(DuplicateKind::Uri)),
             "expected DuplicateSendSession(Uri), got: {err:?}"
         );
+    }
+
+    #[test]
+    fn receiver_session_socks_auth_is_reused_after_reload() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let db = Arc::new(
+            Database::create(temp_dir.path().join("payjoin.sqlite"))
+                .expect("database should initialize"),
+        );
+        let persister =
+            ReceiverPersister::new(db.clone()).expect("receiver session should persist");
+
+        let first_auth =
+            persister.get_or_create_socks_auth().expect("first auth should be generated");
+        let second_auth = ReceiverPersister::from_id(db, persister.session_id().clone())
+            .get_or_create_socks_auth()
+            .expect("stored auth should be reloaded");
+
+        assert_eq!(first_auth, second_auth);
+    }
+
+    #[test]
+    fn receiver_sessions_get_distinct_socks_auth() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let db = Arc::new(
+            Database::create(temp_dir.path().join("payjoin.sqlite"))
+                .expect("database should initialize"),
+        );
+        let first =
+            ReceiverPersister::new(db.clone()).expect("first receiver session should persist");
+        let second = ReceiverPersister::new(db).expect("second receiver session should persist");
+
+        let first_auth =
+            first.get_or_create_socks_auth().expect("first session auth should be generated");
+        let second_auth =
+            second.get_or_create_socks_auth().expect("second session auth should be generated");
+
+        assert_ne!(first_auth, second_auth);
     }
 }

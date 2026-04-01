@@ -27,7 +27,18 @@ use crate::app::{handle_interrupt, http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
+mod bootstrap;
 mod ohttp;
+
+/// Return true if the error chain contains a SOCKS-layer failure.
+///
+/// A SOCKS proxy that is unreachable, refuses the target, or rejects auth will
+/// fail every per-session relay attempt the same way; rotating to another relay
+/// won't help. Callers detect this and surface the SOCKS error directly instead
+/// of burning the relay set.
+pub(crate) fn is_socks_proxy_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<tokio_socks::Error>())
+}
 
 const W_ID: usize = 12;
 const W_ROLE: usize = 25;
@@ -254,11 +265,21 @@ impl AppTrait for App {
 
     async fn receive_payjoin(&self, amount: Amount) -> Result<()> {
         let address = self.wallet().get_new_address()?;
-        let ohttp_keys =
-            unwrap_ohttp_keys_or_else_fetch(&self.config, None, self.relay_manager.clone())
-                .await?
-                .ohttp_keys;
         let persister = ReceiverPersister::new(self.db.clone())?;
+        let session_socks_auth =
+            if self.config.v2()?.socks_proxy.is_some() && self.config.v2()?.tor_stream_isolation {
+                Some(persister.get_or_create_socks_auth()?)
+            } else {
+                None
+            };
+        let ohttp_keys = unwrap_ohttp_keys_or_else_fetch(
+            &self.config,
+            None,
+            self.relay_manager.clone(),
+            session_socks_auth.as_ref(),
+        )
+        .await?
+        .ohttp_keys;
         let session =
             ReceiverBuilder::new(address, self.config.v2()?.pj_directory.as_str(), ohttp_keys)?
                 .with_amount(amount)
@@ -820,9 +841,14 @@ impl App {
         let ohttp_relay = match selected_relay {
             Some(relay) => relay,
             None =>
-                unwrap_ohttp_keys_or_else_fetch(&self.config, directory, self.relay_manager.clone())
-                    .await?
-                    .relay_url,
+                unwrap_ohttp_keys_or_else_fetch(
+                    &self.config,
+                    directory,
+                    self.relay_manager.clone(),
+                    None,
+                )
+                .await?
+                .relay_url,
         };
         Ok(ohttp_relay)
     }

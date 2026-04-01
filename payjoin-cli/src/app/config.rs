@@ -36,7 +36,8 @@ pub struct V2Config {
     pub ohttp_keys: Option<payjoin::OhttpKeys>,
     pub ohttp_relays: Vec<Url>,
     pub pj_directory: Url,
-    pub socks_proxy: Option<Url>,
+    pub socks_proxy: Option<url::Url>,
+    pub tor_stream_isolation: bool,
 }
 
 #[cfg(feature = "v2")]
@@ -47,34 +48,60 @@ impl std::fmt::Debug for V2Config {
             .field("ohttp_relays", &self.ohttp_relays)
             .field("pj_directory", &self.pj_directory)
             .field("socks_proxy", &self.socks_proxy.as_ref().map(redact_url_userinfo))
+            .field("tor_stream_isolation", &self.tor_stream_isolation)
             .finish()
     }
 }
 
 #[cfg(feature = "v2")]
-fn redact_url_userinfo(url: &Url) -> String {
-    match reqwest::Url::parse(url.as_str()) {
-        Ok(mut parsed) => {
-            if !parsed.username().is_empty() {
-                let _ = parsed.set_username("redacted");
-            }
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("redacted"));
-            }
-            parsed.to_string()
-        }
-        Err(_) => url.as_str().to_string(),
+fn redact_url_userinfo(url: &url::Url) -> url::Url {
+    let mut redacted = url.clone();
+    if !redacted.username().is_empty() {
+        let _ = redacted.set_username("redacted");
     }
+    if redacted.password().is_some() {
+        let _ = redacted.set_password(Some("redacted"));
+    }
+    redacted
 }
 
 #[cfg(feature = "v2")]
 impl V2Config {
     fn validate(self) -> Result<Self, ConfigError> {
+        if self.tor_stream_isolation && self.socks_proxy.is_none() {
+            return Err(ConfigError::Message(
+                "BIP77 Tor stream isolation requires a SOCKS proxy".to_owned(),
+            ));
+        }
         if let Some(socks_proxy) = &self.socks_proxy {
             if socks_proxy.scheme() != "socks5h" {
                 return Err(ConfigError::Message(
                     "BIP77 SOCKS proxy must use the socks5h:// scheme".to_owned(),
                 ));
+            }
+            if self.tor_stream_isolation
+                && (!socks_proxy.username().is_empty() || socks_proxy.password().is_some())
+            {
+                return Err(ConfigError::Message(
+                    "BIP77 Tor stream isolation cannot be combined with SOCKS proxy credentials in the URL"
+                        .to_owned(),
+                ));
+            }
+            if self.ohttp_keys.is_none()
+                && self.ohttp_relays.iter().any(|relay| relay.scheme() != "http")
+            {
+                return Err(ConfigError::Message(
+                    "BIP77 SOCKS relay bootstrap currently requires http:// relay URLs".to_owned(),
+                ));
+            }
+            if self.ohttp_keys.is_none() {
+                #[cfg(not(feature = "_manual-tls"))]
+                if self.pj_directory.scheme() != "http" {
+                    return Err(ConfigError::Message(
+                        "BIP77 SOCKS relay bootstrap without _manual-tls requires an http:// directory URL"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         Ok(self)
@@ -103,6 +130,7 @@ pub struct Config {
     #[cfg(feature = "_manual-tls")]
     pub root_certificate: Option<PathBuf>,
     #[cfg(feature = "_manual-tls")]
+    #[cfg_attr(not(feature = "v1"), allow(dead_code))]
     pub certificate_key: Option<PathBuf>,
 }
 
@@ -314,12 +342,14 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
     let config = config
         .set_default("v2.pj_directory", "https://payjo.in")?
         .set_default("v2.ohttp_keys", None::<String>)?
-        .set_default("v2.socks_proxy", None::<String>)?;
+        .set_default("v2.socks_proxy", None::<String>)?
+        .set_default("v2.tor_stream_isolation", false)?;
 
     // Override config values with command line arguments if applicable
     let pj_directory = cli.pj_directory.as_ref().map(|s| s.as_str());
     let ohttp_keys = cli.ohttp_keys.as_ref().map(|p| p.to_string_lossy().into_owned());
     let socks_proxy = cli.socks_proxy.as_ref().map(|url| url.as_str());
+    let tor_stream_isolation = cli.tor_stream_isolation;
     let ohttp_relays = cli
         .ohttp_relays
         .as_ref()
@@ -329,6 +359,7 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
         .set_override_option("v2.pj_directory", pj_directory)?
         .set_override_option("v2.ohttp_keys", ohttp_keys)?
         .set_override_option("v2.socks_proxy", socks_proxy)?
+        .set_override_option("v2.tor_stream_isolation", tor_stream_isolation)?
         .set_override_option("v2.ohttp_relays", ohttp_relays)
 }
 
@@ -409,7 +440,34 @@ where
 
 #[cfg(all(test, feature = "v2"))]
 mod tests {
-    use super::V2Config;
+    use ::config::{Config as RawConfig, File, FileFormat};
+    use clap::Parser;
+
+    use super::{add_v2_defaults, V2Config};
+    use crate::cli::Cli;
+
+    #[test]
+    fn v2_config_preserves_configured_tor_stream_isolation_when_cli_flag_is_absent() {
+        let cli = Cli::try_parse_from(["payjoin-cli", "resume"])
+            .expect("resume command should parse without Tor stream isolation flag");
+        let built_config = add_v2_defaults(RawConfig::builder(), &cli)
+            .expect("v2 defaults should build")
+            .add_source(File::from_str(
+                r#"
+[v2]
+ohttp_relays = ["http://relay.example"]
+socks_proxy = "socks5h://127.0.0.1:9050"
+tor_stream_isolation = true
+"#,
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("test config should build");
+
+        let v2 = built_config.get::<V2Config>("v2").expect("v2 config should deserialize");
+
+        assert!(v2.tor_stream_isolation, "CLI omission must not override configured isolation");
+    }
 
     #[test]
     fn v2_config_accepts_socks5h_proxy() {
@@ -421,8 +479,9 @@ mod tests {
             pj_directory: payjoin::Url::parse("http://directory.example")
                 .expect("static URL is valid"),
             socks_proxy: Some(
-                payjoin::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
             ),
+            tor_stream_isolation: false,
         };
 
         assert!(config.validate().is_ok(), "socks5h proxy should be accepted");
@@ -438,14 +497,126 @@ mod tests {
             pj_directory: payjoin::Url::parse("http://directory.example")
                 .expect("static URL is valid"),
             socks_proxy: Some(
-                payjoin::Url::parse("socks5://127.0.0.1:9050").expect("static URL is valid"),
+                url::Url::parse("socks5://127.0.0.1:9050").expect("static URL is valid"),
             ),
+            tor_stream_isolation: false,
         };
 
         let err = config.validate().expect_err("non-socks5h proxy should be rejected");
         assert!(
             err.to_string().contains("socks5h://"),
             "validation error should explain the required scheme"
+        );
+    }
+
+    #[test]
+    fn v2_config_rejects_https_relays_in_socks_mode() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("https://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("http://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+            tor_stream_isolation: false,
+        };
+
+        let err = config.validate().expect_err("https relay should be rejected in SOCKS mode");
+        assert!(
+            err.to_string().contains("http:// relay"),
+            "validation error should explain the relay scheme restriction"
+        );
+    }
+
+    #[cfg(not(feature = "_manual-tls"))]
+    #[test]
+    fn v2_config_rejects_https_directory_without_manual_tls() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("http://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+            tor_stream_isolation: false,
+        };
+
+        let err =
+            config.validate().expect_err("https directory should be rejected without _manual-tls");
+        assert!(
+            err.to_string().contains("http:// directory"),
+            "validation error should explain the directory scheme restriction"
+        );
+    }
+
+    #[test]
+    fn v2_config_accepts_https_relays_with_preconfigured_ohttp_keys() {
+        let config = V2Config {
+            ohttp_keys: Some(test_ohttp_keys()),
+            ohttp_relays: vec![
+                payjoin::Url::parse("https://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+            tor_stream_isolation: true,
+        };
+
+        assert!(
+            config.validate().is_ok(),
+            "preconfigured OHTTP keys should bypass bootstrap URL restrictions"
+        );
+    }
+
+    #[test]
+    fn v2_config_rejects_tor_stream_isolation_without_socks_proxy() {
+        let config = V2Config {
+            ohttp_keys: Some(test_ohttp_keys()),
+            ohttp_relays: vec![
+                payjoin::Url::parse("https://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: None,
+            tor_stream_isolation: true,
+        };
+
+        let err = config.validate().expect_err("Tor stream isolation should require a SOCKS proxy");
+        assert!(
+            err.to_string().contains("requires a SOCKS proxy"),
+            "validation error should explain the missing SOCKS proxy"
+        );
+    }
+
+    #[test]
+    fn v2_config_rejects_tor_stream_isolation_with_explicit_proxy_credentials() {
+        let config = V2Config {
+            ohttp_keys: Some(test_ohttp_keys()),
+            ohttp_relays: vec![
+                payjoin::Url::parse("https://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://user:pass@127.0.0.1:9050").expect("static URL is valid"),
+            ),
+            tor_stream_isolation: true,
+        };
+
+        let err = config
+            .validate()
+            .expect_err("Tor stream isolation should reject explicit proxy credentials");
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "validation error should explain the credentials conflict"
         );
     }
 
@@ -459,14 +630,29 @@ mod tests {
             pj_directory: payjoin::Url::parse("http://directory.example")
                 .expect("static URL is valid"),
             socks_proxy: Some(
-                payjoin::Url::parse("socks5h://secretuser:secretpass@127.0.0.1:9050")
+                url::Url::parse("socks5h://secretuser:secretpass@127.0.0.1:9050")
                     .expect("static URL is valid"),
             ),
+            tor_stream_isolation: false,
         };
 
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("secretuser"), "username must not appear in Debug output");
         assert!(!rendered.contains("secretpass"), "password must not appear in Debug output");
         assert!(rendered.contains("redacted"), "redaction marker should appear in Debug output");
+    }
+
+    fn test_ohttp_keys() -> payjoin::OhttpKeys {
+        use payjoin::bitcoin::bech32::primitives::decode::CheckedHrpstring;
+        use payjoin::bitcoin::bech32::NoChecksum;
+
+        let bytes = CheckedHrpstring::new::<NoChecksum>(
+            "OH1QYPM5JXYNS754Y4R45QWE336QFX6ZR8DQGVQCULVZTV20TFVEYDMFQC",
+        )
+        .expect("bech32 test vector should decode")
+        .byte_iter()
+        .collect::<Vec<u8>>();
+
+        payjoin::OhttpKeys::try_from(&bytes[..]).expect("test vector should convert to OHTTP keys")
     }
 }
