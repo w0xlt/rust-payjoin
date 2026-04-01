@@ -85,6 +85,15 @@ pub struct Cli {
     )]
     pub socks_proxy: Option<Url>,
 
+    #[cfg(feature = "v2")]
+    #[arg(
+        long = "tor-stream-isolation",
+        help = "Request Tor stream isolation by generating per-session SOCKS credentials",
+        action = clap::ArgAction::SetTrue,
+        global = true
+    )]
+    pub tor_stream_isolation: Option<bool>,
+
     #[cfg(feature = "_manual-tls")]
     #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
     pub root_certificate: Option<PathBuf>,
@@ -196,5 +205,25 @@ mod tests {
             Some("socks5h://127.0.0.1:9050")
         );
         assert!(matches!(cli.command, Commands::Send { .. }));
+    }
+
+    #[test]
+    fn receive_accepts_tor_stream_isolation_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "payjoin-cli",
+            "receive",
+            "--tor-stream-isolation",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "1000",
+        ])
+        .expect("receive subcommand should accept global Tor stream isolation flag");
+
+        assert_eq!(cli.tor_stream_isolation, Some(true));
+        assert_eq!(
+            cli.socks_proxy.as_ref().map(url::Url::as_str),
+            Some("socks5h://127.0.0.1:9050")
+        );
+        assert!(matches!(cli.command, Commands::Receive { .. }));
     }
 }

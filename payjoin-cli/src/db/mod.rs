@@ -37,6 +37,8 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS send_sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 receiver_pubkey BLOB NOT NULL,
+                socks_username TEXT,
+                socks_password TEXT,
                 completed_at INTEGER
             )",
             [],
@@ -45,10 +47,17 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS receive_sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                socks_username TEXT,
+                socks_password TEXT,
                 completed_at INTEGER
             )",
             [],
         )?;
+
+        Self::ensure_column(conn, "send_sessions", "socks_username", "TEXT")?;
+        Self::ensure_column(conn, "send_sessions", "socks_password", "TEXT")?;
+        Self::ensure_column(conn, "receive_sessions", "socks_username", "TEXT")?;
+        Self::ensure_column(conn, "receive_sessions", "socks_password", "TEXT")?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS send_session_events (
@@ -80,6 +89,20 @@ impl Database {
             [],
         )?;
 
+        Ok(())
+    }
+
+    fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let existing_columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        for existing_column in existing_columns {
+            if existing_column? == column {
+                return Ok(());
+            }
+        }
+
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
         Ok(())
     }
 

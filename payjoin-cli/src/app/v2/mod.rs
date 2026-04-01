@@ -28,6 +28,7 @@ use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
 mod ohttp;
+mod bootstrap;
 
 const W_ID: usize = 12;
 const W_ROLE: usize = 25;
