@@ -19,7 +19,14 @@ impl RelayManager {
 
     pub fn get_selected_relay(&self) -> Option<url::Url> { self.selected_relay.clone() }
 
-    pub fn add_failed_relay(&mut self, relay: url::Url) { self.failed_relays.push(relay); }
+    pub fn mark_relay_failed(&mut self, relay: url::Url) {
+        if self.selected_relay.as_ref() == Some(&relay) {
+            self.selected_relay = None;
+        }
+        if !self.failed_relays.contains(&relay) {
+            self.failed_relays.push(relay);
+        }
+    }
 
     pub fn get_failed_relays(&self) -> Vec<url::Url> { self.failed_relays.clone() }
 }
@@ -148,7 +155,7 @@ async fn fetch_ohttp_keys(
                 relay_manager
                     .lock()
                     .expect("Lock should not be poisoned")
-                    .add_failed_relay(selected_relay);
+                    .mark_relay_failed(selected_relay);
             }
         }
     }

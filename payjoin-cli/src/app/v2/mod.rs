@@ -22,9 +22,12 @@ use tokio::sync::watch;
 use super::config::Config;
 use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
-use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
-use crate::app::{handle_interrupt, http_agent};
-use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
+use crate::app::v2::ohttp::{
+    unwrap_ohttp_keys_or_else_fetch, unwrap_relay_or_else_fetch as resolve_relay_or_else_fetch,
+    RelayManager,
+};
+use crate::app::{handle_interrupt, http_agent, v2_http_agent};
+use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId, SocksAuth};
 use crate::db::Database;
 
 mod bootstrap;
@@ -35,13 +38,77 @@ const W_ROLE: usize = 25;
 const W_DONE: usize = 15;
 const W_STATUS: usize = 15;
 
+async fn post_v2_request(
+    config: &Config,
+    req: payjoin::Request,
+    session_socks_auth: Option<&SocksAuth>,
+) -> Result<reqwest::Response> {
+    let http = v2_http_agent(config, session_socks_auth)?;
+    let response = http
+        .post(req.url)
+        .header("Content-Type", req.content_type)
+        .body(req.body)
+        .send()
+        .await
+        .map_err(anyhow::Error::from)?;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        return response.error_for_status().map_err(anyhow::Error::from);
+    }
+    Ok(response)
+}
+
+fn should_fail_over_relay(err: &anyhow::Error) -> bool {
+    err.chain().find_map(|cause| cause.downcast_ref::<reqwest::Error>()).is_some_and(
+        |reqwest_err| {
+            reqwest_err.status().is_none()
+                || reqwest_err
+                    .status()
+                    .is_some_and(|status| {
+                        status == reqwest::StatusCode::NOT_FOUND || status.is_server_error()
+                    })
+        },
+    )
+}
+
+async fn post_v2_request_with_relay_failover<C, E, F>(
+    config: &Config,
+    relay_manager: Arc<Mutex<RelayManager>>,
+    directory: Option<url::Url>,
+    session_socks_auth: Option<&SocksAuth>,
+    mut create_request: F,
+) -> Result<(reqwest::Response, C)>
+where
+    F: FnMut(&url::Url) -> std::result::Result<(payjoin::Request, C), E>,
+    E: Into<anyhow::Error>,
+{
+    loop {
+        let relay = resolve_relay_or_else_fetch(
+            config,
+            directory.clone(),
+            relay_manager.clone(),
+            session_socks_auth,
+        )
+        .await?;
+        let (req, ctx) = create_request(&relay).map_err(Into::into)?;
+        match post_v2_request(config, req, session_socks_auth).await {
+            Ok(response) => return Ok((response, ctx)),
+            Err(err) if should_fail_over_relay(&err) => {
+                tracing::warn!(
+                    "Relay request through {relay} failed, retrying with another relay: {err}"
+                );
+                relay_manager.lock().expect("Lock should not be poisoned").mark_relay_failed(relay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct App {
     config: Config,
     db: Arc<Database>,
     wallet: BitcoindWallet,
     interrupt: watch::Receiver<()>,
-    relay_manager: Arc<Mutex<RelayManager>>,
 }
 
 trait StatusText {
@@ -141,11 +208,10 @@ impl<Status: StatusText> fmt::Display for SessionHistoryRow<Status> {
 impl AppTrait for App {
     async fn new(config: Config) -> Result<Self> {
         let db = Arc::new(Database::create(&config.db_path)?);
-        let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
         let (interrupt_tx, interrupt_rx) = watch::channel(());
         tokio::spawn(handle_interrupt(interrupt_tx));
         let wallet = BitcoindWallet::new(&config.bitcoind).await?;
-        let app = Self { config, db, wallet, interrupt: interrupt_rx, relay_manager };
+        let app = Self { config, db, wallet, interrupt: interrupt_rx };
         app.wallet()
             .network()
             .context("Failed to connect to bitcoind. Check config RPC connection.")?;
@@ -197,7 +263,8 @@ impl AppTrait for App {
                     "Sent fallback transaction hex: {:#}",
                     payjoin::bitcoin::consensus::encode::serialize_hex(&fallback_tx)
                 );
-                let psbt = ctx.process_response(&response.bytes().await?).map_err(|e| {
+                let response_bytes = response.bytes().await?;
+                let psbt = ctx.process_response(response_bytes.as_ref()).map_err(|e| {
                     tracing::debug!("Error processing response: {e:?}");
                     anyhow!("Failed to process response {e}")
                 })?;
@@ -240,9 +307,10 @@ impl AppTrait for App {
                         (SendSession::WithReplyKey(sender), persister)
                     }
                 };
+                let relay_manager = Self::new_relay_manager();
                 let mut interrupt = self.interrupt.clone();
                 tokio::select! {
-                    _ = self.process_sender_session(sender_state, &persister) => return Ok(()),
+                    _ = self.process_sender_session(sender_state, &persister, relay_manager) => return Ok(()),
                     _ = interrupt.changed() => {
                         println!("Interrupted. Call `send` with the same arguments to resume this session or `resume` to resume all sessions.");
                         return Err(anyhow!("Interrupted"))
@@ -256,7 +324,7 @@ impl AppTrait for App {
     async fn receive_payjoin(&self, amount: Amount) -> Result<()> {
         let address = self.wallet().get_new_address()?;
         let ohttp_keys =
-            unwrap_ohttp_keys_or_else_fetch(&self.config, None, self.relay_manager.clone())
+            unwrap_ohttp_keys_or_else_fetch(&self.config, None, self.relay_manager.clone(), None)
                 .await?
                 .ohttp_keys;
         let persister = ReceiverPersister::new(self.db.clone())?;
@@ -312,8 +380,11 @@ impl AppTrait for App {
             match replay_sender_event_log(&sender_persiter) {
                 Ok((sender_state, _)) => {
                     let self_clone = self.clone();
+                    let relay_manager = Self::new_relay_manager();
                     tasks.push(tokio::spawn(async move {
-                        self_clone.process_sender_session(sender_state, &sender_persiter).await
+                        self_clone
+                            .process_sender_session(sender_state, &sender_persiter, relay_manager)
+                            .await
                     }));
                 }
                 Err(e) => {
@@ -465,6 +536,8 @@ impl AppTrait for App {
 }
 
 impl App {
+    fn new_relay_manager() -> Arc<Mutex<RelayManager>> { Arc::new(Mutex::new(RelayManager::new())) }
+
     fn close_failed_session<P>(persister: &P, session_id: &SessionId, role: &str)
     where
         P: SessionPersister,
@@ -476,16 +549,36 @@ impl App {
         }
     }
 
+    fn uses_tor_stream_isolation(&self) -> Result<bool> {
+        let v2 = self.config.v2()?;
+        Ok(v2.socks_proxy.is_some() && v2.tor_stream_isolation)
+    }
+
+    fn sender_socks_auth(&self, persister: &SenderPersister) -> Result<Option<SocksAuth>> {
+        if self.uses_tor_stream_isolation()? {
+            return Ok(Some(persister.get_or_create_socks_auth()?));
+        }
+        Ok(None)
+    }
+
+    fn receiver_socks_auth(&self, persister: &ReceiverPersister) -> Result<Option<SocksAuth>> {
+        if self.uses_tor_stream_isolation()? {
+            return Ok(Some(persister.get_or_create_socks_auth()?));
+        }
+        Ok(None)
+    }
+
     async fn process_sender_session(
         &self,
         session: SendSession,
         persister: &SenderPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         match session {
             SendSession::WithReplyKey(context) =>
-                self.post_original_proposal(context, persister).await?,
+                self.post_original_proposal(context, persister, relay_manager).await?,
             SendSession::PollingForProposal(context) =>
-                self.get_proposed_payjoin_psbt(context, persister).await?,
+                self.get_proposed_payjoin_psbt(context, persister, relay_manager).await?,
             SendSession::Closed(SenderSessionOutcome::Success(proposal)) => {
                 self.process_pj_response(proposal)?;
                 return Ok(());
@@ -499,27 +592,42 @@ impl App {
         &self,
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
-        let (req, ctx) = sender.create_v2_post_request(
-            self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?.as_str(),
-        )?;
-        let response = self.post_request(req).await?;
+        let endpoint = url::Url::parse(&sender.endpoint())?;
+        let session_socks_auth = self.sender_socks_auth(persister)?;
+        let (response, ctx) = post_v2_request_with_relay_failover(
+            &self.config,
+            relay_manager.clone(),
+            Some(endpoint),
+            session_socks_auth.as_ref(),
+            |relay| sender.create_v2_post_request(relay.as_str()),
+        )
+        .await?;
         println!("Posted original proposal...");
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
-        self.get_proposed_payjoin_psbt(sender, persister).await
+        self.get_proposed_payjoin_psbt(sender, persister, relay_manager).await
     }
 
     async fn get_proposed_payjoin_psbt(
         &self,
         sender: Sender<PollingForProposal>,
         persister: &SenderPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
-        let ohttp_relay = self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?;
+        let endpoint = url::Url::parse(&sender.endpoint())?;
+        let session_socks_auth = self.sender_socks_auth(persister)?;
         let mut session = sender.clone();
         // Long poll until we get a response
         loop {
-            let (req, ctx) = session.create_poll_request(ohttp_relay.as_str())?;
-            let response = self.post_request(req).await?;
+            let (response, ctx) = post_v2_request_with_relay_failover(
+                &self.config,
+                relay_manager.clone(),
+                Some(endpoint.clone()),
+                session_socks_auth.as_ref(),
+                |relay| session.create_poll_request(relay.as_str()),
+            )
+            .await?;
             let res = session.process_response(&response.bytes().await?, ctx).save(persister);
             match res {
                 Ok(OptionalTransitionOutcome::Progress(psbt)) => {
@@ -811,23 +919,6 @@ impl App {
         }
     }
 
-    async fn unwrap_relay_or_else_fetch(
-        &self,
-        directory: Option<impl payjoin::IntoUrl>,
-    ) -> Result<url::Url> {
-        let directory = directory.map(|url| url.into_url()).transpose()?;
-        let selected_relay =
-            self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
-        let ohttp_relay = match selected_relay {
-            Some(relay) => relay,
-            None =>
-                unwrap_ohttp_keys_or_else_fetch(&self.config, directory, self.relay_manager.clone())
-                    .await?
-                    .relay_url,
-        };
-        Ok(ohttp_relay)
-    }
-
     /// Handle error by attempting to send an error response over the directory
     async fn handle_error(
         &self,
@@ -854,8 +945,35 @@ impl App {
         Ok(())
     }
 
+    async fn unwrap_relay_or_else_fetch(
+        &self,
+        directory: Option<impl payjoin::IntoUrl>,
+    ) -> Result<url::Url> {
+        let directory = directory.map(|url| url.into_url()).transpose()?;
+        let selected_relay =
+            self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
+        let ohttp_relay = match selected_relay {
+            Some(relay) => relay,
+            None =>
+                unwrap_ohttp_keys_or_else_fetch(&self.config, directory, self.relay_manager.clone())
+                    .await?
+                    .relay_url,
+        };
+        Ok(ohttp_relay)
+    }
+
     async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
         let http = http_agent(&self.config)?;
+        http.post(req.url)
+            .header("Content-Type", req.content_type)
+            .body(req.body)
+            .send()
+            .await
+            .map_err(map_reqwest_err)
+    }
+
+    async fn post_v2_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
+        let http = v2_http_agent(&self.config)?;
         http.post(req.url)
             .header("Content-Type", req.content_type)
             .body(req.body)
@@ -869,5 +987,423 @@ fn map_reqwest_err(e: reqwest::Error) -> anyhow::Error {
     match e.status() {
         Some(status_code) => anyhow!("HTTP request failed: {} {}", status_code, e),
         None => anyhow!("No HTTP response: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use payjoin::bitcoin::bech32::primitives::decode::CheckedHrpstring;
+    use payjoin::bitcoin::bech32::NoChecksum;
+    use payjoin::bitcoin::{Address, Network};
+    use payjoin::persist::NoopSessionPersister;
+    use payjoin::receive::v2::ReceiverBuilder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use url::Url;
+
+    use super::*;
+    use crate::app::config::{BitcoindConfig, V2Config, VersionConfig};
+
+    #[tokio::test]
+    async fn configured_ohttp_keys_fail_over_from_cached_dead_relay() {
+        let bad_listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("dead relay test listener should bind");
+        let bad_port = bad_listener
+            .local_addr()
+            .expect("dead relay test listener should have a local address")
+            .port();
+        drop(bad_listener);
+
+        let good_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy relay test listener should bind");
+        let good_port = good_listener
+            .local_addr()
+            .expect("healthy relay test listener should have a local address")
+            .port();
+        let good_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                good_listener.accept().await.expect("healthy relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("healthy relay should read the full request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("healthy relay should write a success response");
+            stream.shutdown().await.expect("healthy relay should close the connection");
+        });
+
+        let bad_relay = Url::parse(&format!("http://127.0.0.1:{bad_port}"))
+            .expect("dead relay URL should parse");
+        let good_relay = Url::parse(&format!("http://127.0.0.1:{good_port}"))
+            .expect("healthy relay URL should parse");
+        let config = test_config(vec![bad_relay.clone(), good_relay.clone()]);
+        let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
+        relay_manager
+            .lock()
+            .expect("Lock should not be poisoned")
+            .set_selected_relay(bad_relay.clone());
+
+        let receiver =
+            ReceiverBuilder::new(test_address(), "https://directory.example", test_ohttp_keys())
+                .expect("receiver builder should initialize")
+                .build()
+                .save(&NoopSessionPersister::default())
+                .expect("receiver session should save");
+
+        let (response, _) = post_v2_request_with_relay_failover(
+            &config,
+            relay_manager.clone(),
+            None,
+            None,
+            |relay| receiver.create_poll_request(relay.as_str()),
+        )
+        .await
+        .expect("healthy relay should be selected after failover");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let (selected_relay, failed_relays) = {
+            let manager = relay_manager.lock().expect("Lock should not be poisoned");
+            (manager.get_selected_relay(), manager.get_failed_relays())
+        };
+        assert_eq!(selected_relay, Some(good_relay));
+        assert_eq!(failed_relays, vec![bad_relay]);
+
+        good_handle.await.expect("healthy relay task should complete");
+    }
+
+    #[tokio::test]
+    async fn configured_ohttp_keys_fail_over_from_cached_server_error_relay() {
+        let bad_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failing relay test listener should bind");
+        let bad_port = bad_listener
+            .local_addr()
+            .expect("failing relay test listener should have a local address")
+            .port();
+        let bad_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                bad_listener.accept().await.expect("failing relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("failing relay should read the full request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("failing relay should write an error response");
+            stream.shutdown().await.expect("failing relay should close the connection");
+        });
+
+        let good_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy relay test listener should bind");
+        let good_port = good_listener
+            .local_addr()
+            .expect("healthy relay test listener should have a local address")
+            .port();
+        let good_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                good_listener.accept().await.expect("healthy relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("healthy relay should read the full request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("healthy relay should write a success response");
+            stream.shutdown().await.expect("healthy relay should close the connection");
+        });
+
+        let bad_relay = Url::parse(&format!("http://127.0.0.1:{bad_port}"))
+            .expect("failing relay URL should parse");
+        let good_relay = Url::parse(&format!("http://127.0.0.1:{good_port}"))
+            .expect("healthy relay URL should parse");
+        let config = test_config(vec![bad_relay.clone(), good_relay.clone()]);
+        let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
+        relay_manager
+            .lock()
+            .expect("Lock should not be poisoned")
+            .set_selected_relay(bad_relay.clone());
+
+        let receiver =
+            ReceiverBuilder::new(test_address(), "https://directory.example", test_ohttp_keys())
+                .expect("receiver builder should initialize")
+                .build()
+                .save(&NoopSessionPersister::default())
+                .expect("receiver session should save");
+
+        let (response, _) = post_v2_request_with_relay_failover(
+            &config,
+            relay_manager.clone(),
+            None,
+            None,
+            |relay| receiver.create_poll_request(relay.as_str()),
+        )
+        .await
+        .expect("healthy relay should be selected after server-error failover");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let (selected_relay, failed_relays) = {
+            let manager = relay_manager.lock().expect("Lock should not be poisoned");
+            (manager.get_selected_relay(), manager.get_failed_relays())
+        };
+        assert_eq!(selected_relay, Some(good_relay));
+        assert_eq!(failed_relays, vec![bad_relay]);
+
+        bad_handle.await.expect("failing relay task should complete");
+        good_handle.await.expect("healthy relay task should complete");
+    }
+
+    #[tokio::test]
+    async fn configured_ohttp_keys_fail_over_from_cached_not_found_relay() {
+        let bad_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("not-found relay test listener should bind");
+        let bad_port = bad_listener
+            .local_addr()
+            .expect("not-found relay test listener should have a local address")
+            .port();
+        let bad_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                bad_listener.accept().await.expect("not-found relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("not-found relay should read the full request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("not-found relay should write an error response");
+            stream.shutdown().await.expect("not-found relay should close the connection");
+        });
+
+        let good_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy relay test listener should bind");
+        let good_port = good_listener
+            .local_addr()
+            .expect("healthy relay test listener should have a local address")
+            .port();
+        let good_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                good_listener.accept().await.expect("healthy relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("healthy relay should read the full request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("healthy relay should write a success response");
+            stream.shutdown().await.expect("healthy relay should close the connection");
+        });
+
+        let bad_relay = Url::parse(&format!("http://127.0.0.1:{bad_port}"))
+            .expect("not-found relay URL should parse");
+        let good_relay = Url::parse(&format!("http://127.0.0.1:{good_port}"))
+            .expect("healthy relay URL should parse");
+        let config = test_config(vec![bad_relay.clone(), good_relay.clone()]);
+        let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
+        relay_manager
+            .lock()
+            .expect("Lock should not be poisoned")
+            .set_selected_relay(bad_relay.clone());
+
+        let receiver =
+            ReceiverBuilder::new(test_address(), "https://directory.example", test_ohttp_keys())
+                .expect("receiver builder should initialize")
+                .build()
+                .save(&NoopSessionPersister::default())
+                .expect("receiver session should save");
+
+        let (response, _) = post_v2_request_with_relay_failover(
+            &config,
+            relay_manager.clone(),
+            None,
+            None,
+            |relay| receiver.create_poll_request(relay.as_str()),
+        )
+        .await
+        .expect("healthy relay should be selected after not-found failover");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let (selected_relay, failed_relays) = {
+            let manager = relay_manager.lock().expect("Lock should not be poisoned");
+            (manager.get_selected_relay(), manager.get_failed_relays())
+        };
+        assert_eq!(selected_relay, Some(good_relay));
+        assert_eq!(failed_relays, vec![bad_relay]);
+
+        bad_handle.await.expect("not-found relay task should complete");
+        good_handle.await.expect("healthy relay task should complete");
+    }
+
+    #[tokio::test]
+    async fn configured_ohttp_keys_do_not_fail_over_from_cached_bad_request_relay() {
+        let bad_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bad-request relay test listener should bind");
+        let bad_port = bad_listener
+            .local_addr()
+            .expect("bad-request relay test listener should have a local address")
+            .port();
+        let bad_handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                bad_listener.accept().await.expect("bad-request relay should accept a client");
+            read_http_request(&mut stream)
+                .await
+                .expect("bad-request relay should read the full request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("bad-request relay should write an error response");
+            stream.shutdown().await.expect("bad-request relay should close the connection");
+        });
+
+        let good_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy relay test listener should bind");
+        let good_port = good_listener
+            .local_addr()
+            .expect("healthy relay test listener should have a local address")
+            .port();
+
+        let bad_relay = Url::parse(&format!("http://127.0.0.1:{bad_port}"))
+            .expect("bad-request relay URL should parse");
+        let good_relay = Url::parse(&format!("http://127.0.0.1:{good_port}"))
+            .expect("healthy relay URL should parse");
+        let config = test_config(vec![bad_relay.clone(), good_relay.clone()]);
+        let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
+        relay_manager
+            .lock()
+            .expect("Lock should not be poisoned")
+            .set_selected_relay(bad_relay.clone());
+
+        let receiver =
+            ReceiverBuilder::new(test_address(), "https://directory.example", test_ohttp_keys())
+                .expect("receiver builder should initialize")
+                .build()
+                .save(&NoopSessionPersister::default())
+                .expect("receiver session should save");
+
+        let err = match post_v2_request_with_relay_failover(
+            &config,
+            relay_manager.clone(),
+            None,
+            None,
+            |relay| receiver.create_poll_request(relay.as_str()),
+        )
+        .await
+        {
+            Ok(_) => panic!("bad request should not fail over to another relay"),
+            Err(err) => err,
+        };
+
+        let reqwest_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .expect("bad request should surface a reqwest status error");
+        assert_eq!(reqwest_err.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+
+        let (selected_relay, failed_relays) = {
+            let manager = relay_manager.lock().expect("Lock should not be poisoned");
+            (manager.get_selected_relay(), manager.get_failed_relays())
+        };
+        assert_eq!(selected_relay, Some(bad_relay));
+        assert!(failed_relays.is_empty());
+
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), good_listener.accept())
+            .await
+            .expect_err("healthy relay should not receive a request");
+
+        bad_handle.await.expect("bad-request relay task should complete");
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut content_length = None;
+
+        loop {
+            let mut buf = [0u8; 4096];
+            let bytes_read = stream.read(&mut buf).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..bytes_read]);
+
+            if let Some(header_end) =
+                request.windows(4).position(|window| window == b"\r\n\r\n").map(|idx| idx + 4)
+            {
+                if content_length.is_none() {
+                    content_length =
+                        std::str::from_utf8(&request[..header_end]).ok().and_then(|headers| {
+                            headers.lines().find_map(|line| {
+                                line.split_once(':').and_then(|(name, value)| {
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                            })
+                        });
+                }
+
+                let body_len = request.len().saturating_sub(header_end);
+                if body_len >= content_length.unwrap_or(0) {
+                    break;
+                }
+            }
+        }
+
+        Ok(request)
+    }
+
+    fn test_config(ohttp_relays: Vec<Url>) -> Config {
+        Config {
+            db_path: std::path::PathBuf::from("unused-payjoin.sqlite"),
+            max_fee_rate: None,
+            bitcoind: BitcoindConfig {
+                rpchost: Url::parse("http://127.0.0.1:18443").expect("static RPC URL is valid"),
+                cookie: None,
+                rpcuser: "bitcoin".to_owned(),
+                rpcpassword: String::new(),
+            },
+            version: Some(VersionConfig::V2(V2Config {
+                ohttp_keys: Some(test_ohttp_keys()),
+                ohttp_relays,
+                pj_directory: Url::parse("https://directory.example")
+                    .expect("static directory URL should parse"),
+                socks_proxy: None,
+                tor_stream_isolation: false,
+            })),
+            #[cfg(feature = "_manual-tls")]
+            root_certificate: None,
+            #[cfg(feature = "_manual-tls")]
+            certificate_key: None,
+        }
+    }
+
+    fn test_address() -> Address {
+        Address::from_str("bcrt1qxjg7w7g5nwqv0u7lpaxxjfdall2k4f4k0yucj5")
+            .expect("static address should parse")
+            .require_network(Network::Regtest)
+            .expect("static address should match regtest")
+    }
+
+    fn test_ohttp_keys() -> payjoin::OhttpKeys {
+        let bytes = CheckedHrpstring::new::<NoChecksum>(
+            "OH1QYPM5JXYNS754Y4R45QWE336QFX6ZR8DQGVQCULVZTV20TFVEYDMFQC",
+        )
+        .expect("bech32 test vector should decode")
+        .byte_iter()
+        .collect::<Vec<u8>>();
+
+        payjoin::OhttpKeys::try_from(&bytes[..]).expect("test vector should convert to OHTTP keys")
     }
 }
