@@ -12,6 +12,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     #[serde(deserialize_with = "deserialize_duration_secs")]
     pub timeout: Duration,
+    pub outbound_socks_proxy: Option<url::Url>,
     pub v1: Option<V1Config>,
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<TelemetryConfig>,
@@ -85,6 +86,7 @@ impl Default for Config {
             listener: "[::]:8080".parse().expect("valid default listener address"),
             storage_dir: PathBuf::from("./data"),
             timeout: Duration::from_secs(30),
+            outbound_socks_proxy: None,
             v1: None,
             #[cfg(feature = "telemetry")]
             telemetry: None,
@@ -109,12 +111,14 @@ impl Config {
         listener: ListenerAddress,
         storage_dir: PathBuf,
         timeout: Duration,
+        outbound_socks_proxy: Option<url::Url>,
         v1: Option<V1Config>,
     ) -> Self {
         Self {
             listener,
             storage_dir,
             timeout,
+            outbound_socks_proxy,
             v1,
             #[cfg(feature = "telemetry")]
             telemetry: None,
