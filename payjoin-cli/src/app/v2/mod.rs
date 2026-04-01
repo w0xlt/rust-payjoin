@@ -27,6 +27,7 @@ use crate::app::{handle_interrupt, http_agent};
 use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
+mod bootstrap;
 mod ohttp;
 
 const W_ID: usize = 12;
