@@ -2888,12 +2888,14 @@ dependencies = [
  "tokio-listener",
  "tokio-rustls 0.26.4",
  "tokio-rustls-acme",
+ "tokio-socks",
  "tokio-stream",
  "tokio-tungstenite",
  "tower",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "url",
  "uuid",
 ]
 

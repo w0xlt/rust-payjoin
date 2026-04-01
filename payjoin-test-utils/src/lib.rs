@@ -121,6 +121,7 @@ pub async fn init_directory(
         "[::]:0".parse().expect("valid listener address"),
         tempdir.path().to_path_buf(),
         Duration::from_secs(2),
+        None,
         Some(payjoin_mailroom::config::V1Config::default()),
     );
 
@@ -151,6 +152,7 @@ pub async fn init_ohttp_relay(
         "[::]:0".parse().expect("valid listener address"),
         tempdir.path().to_path_buf(),
         Duration::from_secs(2),
+        None,
         None,
     );
 
