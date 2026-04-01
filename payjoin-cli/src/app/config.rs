@@ -67,7 +67,7 @@ fn redact_url_userinfo(url: &url::Url) -> url::Url {
 
 #[cfg(feature = "v2")]
 impl V2Config {
-    fn validate(self) -> Result<Self, ConfigError> {
+    fn validate(self, uses_configured_directory: bool) -> Result<Self, ConfigError> {
         if self.tor_stream_isolation && self.socks_proxy.is_none() {
             return Err(ConfigError::Message(
                 "BIP77 Tor stream isolation requires a SOCKS proxy".to_owned(),
@@ -94,7 +94,7 @@ impl V2Config {
                     "BIP77 SOCKS relay bootstrap currently requires http:// relay URLs".to_owned(),
                 ));
             }
-            if self.ohttp_keys.is_none() {
+            if self.ohttp_keys.is_none() && uses_configured_directory {
                 #[cfg(not(feature = "_manual-tls"))]
                 if self.pj_directory.scheme() != "http" {
                     return Err(ConfigError::Message(
@@ -250,7 +250,12 @@ impl Config {
                 #[cfg(feature = "v2")]
                 {
                     match built_config.get::<V2Config>("v2") {
-                        Ok(v2) => config.version = Some(VersionConfig::V2(v2.validate()?)),
+                        Ok(v2) => {
+                            let uses_configured_directory =
+                                matches!(&cli.command, Commands::Receive { .. });
+                            config.version =
+                                Some(VersionConfig::V2(v2.validate(uses_configured_directory)?));
+                        }
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V2 configuration is required for BIP77 mode: {e}"
@@ -484,7 +489,7 @@ tor_stream_isolation = true
             tor_stream_isolation: false,
         };
 
-        assert!(config.validate().is_ok(), "socks5h proxy should be accepted");
+        assert!(config.validate(false).is_ok(), "socks5h proxy should be accepted");
     }
 
     #[test]
@@ -502,7 +507,7 @@ tor_stream_isolation = true
             tor_stream_isolation: false,
         };
 
-        let err = config.validate().expect_err("non-socks5h proxy should be rejected");
+        let err = config.validate(false).expect_err("non-socks5h proxy should be rejected");
         assert!(
             err.to_string().contains("socks5h://"),
             "validation error should explain the required scheme"
@@ -524,7 +529,7 @@ tor_stream_isolation = true
             tor_stream_isolation: false,
         };
 
-        let err = config.validate().expect_err("https relay should be rejected in SOCKS mode");
+        let err = config.validate(false).expect_err("https relay should be rejected in SOCKS mode");
         assert!(
             err.to_string().contains("http:// relay"),
             "validation error should explain the relay scheme restriction"
@@ -533,7 +538,7 @@ tor_stream_isolation = true
 
     #[cfg(not(feature = "_manual-tls"))]
     #[test]
-    fn v2_config_rejects_https_directory_without_manual_tls() {
+    fn v2_receive_config_rejects_https_directory_without_manual_tls() {
         let config = V2Config {
             ohttp_keys: None,
             ohttp_relays: vec![
@@ -547,11 +552,34 @@ tor_stream_isolation = true
             tor_stream_isolation: false,
         };
 
-        let err =
-            config.validate().expect_err("https directory should be rejected without _manual-tls");
+        let err = config
+            .validate(true)
+            .expect_err("https directory should be rejected without _manual-tls");
         assert!(
             err.to_string().contains("http:// directory"),
             "validation error should explain the directory scheme restriction"
+        );
+    }
+
+    #[cfg(not(feature = "_manual-tls"))]
+    #[test]
+    fn v2_send_config_accepts_unused_https_directory_without_manual_tls() {
+        let config = V2Config {
+            ohttp_keys: None,
+            ohttp_relays: vec![
+                payjoin::Url::parse("http://relay.example").expect("static URL is valid")
+            ],
+            pj_directory: payjoin::Url::parse("https://directory.example")
+                .expect("static URL is valid"),
+            socks_proxy: Some(
+                url::Url::parse("socks5h://127.0.0.1:9050").expect("static URL is valid"),
+            ),
+            tor_stream_isolation: false,
+        };
+
+        assert!(
+            config.validate(false).is_ok(),
+            "send bootstraps against the BIP21 endpoint, not the configured receiver directory"
         );
     }
 
@@ -571,7 +599,7 @@ tor_stream_isolation = true
         };
 
         assert!(
-            config.validate().is_ok(),
+            config.validate(false).is_ok(),
             "preconfigured OHTTP keys should bypass bootstrap URL restrictions"
         );
     }
@@ -589,7 +617,8 @@ tor_stream_isolation = true
             tor_stream_isolation: true,
         };
 
-        let err = config.validate().expect_err("Tor stream isolation should require a SOCKS proxy");
+        let err =
+            config.validate(false).expect_err("Tor stream isolation should require a SOCKS proxy");
         assert!(
             err.to_string().contains("requires a SOCKS proxy"),
             "validation error should explain the missing SOCKS proxy"
@@ -612,7 +641,7 @@ tor_stream_isolation = true
         };
 
         let err = config
-            .validate()
+            .validate(false)
             .expect_err("Tor stream isolation should reject explicit proxy credentials");
         assert!(
             err.to_string().contains("cannot be combined"),

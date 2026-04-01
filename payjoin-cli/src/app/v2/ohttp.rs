@@ -29,7 +29,14 @@ impl RelayManager {
 
     pub fn get_selected_relay(&self) -> Option<Url> { self.selected_relay.clone() }
 
-    pub fn add_failed_relay(&mut self, relay: Url) { self.failed_relays.push(relay); }
+    pub fn mark_relay_failed(&mut self, relay: Url) {
+        if self.selected_relay.as_ref() == Some(&relay) {
+            self.selected_relay = None;
+        }
+        if !self.failed_relays.contains(&relay) {
+            self.failed_relays.push(relay);
+        }
+    }
 
     pub fn get_failed_relays(&self) -> Vec<Url> { self.failed_relays.clone() }
 }
@@ -165,7 +172,7 @@ async fn fetch_ohttp_keys(
                 relay_manager
                     .lock()
                     .expect("Lock should not be poisoned")
-                    .add_failed_relay(selected_relay);
+                    .mark_relay_failed(selected_relay);
             }
         }
     }
@@ -213,7 +220,10 @@ mod tests {
     fn relay_failures_are_scoped_to_each_manager() {
         let relay = Url::parse("https://relay.example").expect("static URL is valid");
         let failed_manager = Arc::new(Mutex::new(RelayManager::new()));
-        failed_manager.lock().expect("lock should not be poisoned").add_failed_relay(relay.clone());
+        failed_manager
+            .lock()
+            .expect("lock should not be poisoned")
+            .mark_relay_failed(relay.clone());
 
         let config = test_config(vec![relay.clone()]);
         let err = select_relay(&config, failed_manager)
