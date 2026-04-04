@@ -1,3 +1,5 @@
+use std::io;
+use std::net::IpAddr;
 use std::result::Result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,13 +13,16 @@ use http::StatusCode;
 use ohttp::hpke::{Aead, Kdf, Kem};
 use ohttp::{KeyId, SymmetricSuite};
 use once_cell::sync::{Lazy, OnceCell};
-use payjoin::io::{fetch_ohttp_keys_with_cert, Error as IOError};
+use payjoin::io::{fetch_ohttp_keys, fetch_ohttp_keys_with_cert, Error as IOError};
 use payjoin::OhttpKeys;
 use rcgen::Certificate;
 use reqwest::{Client, ClientBuilder};
 use rustls::pki_types::CertificateDer;
 use rustls::RootCertStore;
 use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -44,9 +49,164 @@ pub fn init_tracing() {
 
 pub struct TestServices {
     cert: Certificate,
+    directory_scheme: &'static str,
     directory: (u16, Option<JoinHandle<Result<(), BoxSendSyncError>>>),
     ohttp_relay: (u16, Option<JoinHandle<Result<(), BoxSendSyncError>>>),
     http_agent: Arc<Client>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Socks5AuthMode {
+    NoAuth,
+    UsernamePassword,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksConnectRecord {
+    pub target_host: String,
+    pub target_port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+pub struct TestSocks5Proxy {
+    port: u16,
+    records: Arc<Mutex<Vec<SocksConnectRecord>>>,
+    handle: Option<JoinHandle<Result<(), BoxSendSyncError>>>,
+}
+
+impl TestSocks5Proxy {
+    pub async fn start(auth_mode: Socks5AuthMode) -> Result<Self, BoxSendSyncError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let records_for_task = records.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await?;
+                let records = records_for_task.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_socks5_client(stream, auth_mode, records).await {
+                        tracing::warn!("SOCKS5 test proxy connection failed: {err}");
+                    }
+                });
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        Ok(Self { port, records, handle: Some(handle) })
+    }
+
+    pub fn url(&self) -> String { format!("socks5h://127.0.0.1:{}", self.port) }
+
+    pub async fn records(&self) -> Vec<SocksConnectRecord> { self.records.lock().await.clone() }
+
+    pub fn take_handle(&mut self) -> JoinHandle<Result<(), BoxSendSyncError>> {
+        self.handle.take().expect("SOCKS5 proxy handle not found")
+    }
+}
+
+async fn handle_socks5_client(
+    mut inbound: TcpStream,
+    auth_mode: Socks5AuthMode,
+    records: Arc<Mutex<Vec<SocksConnectRecord>>>,
+) -> Result<(), BoxSendSyncError> {
+    let mut greeting = [0u8; 2];
+    inbound.read_exact(&mut greeting).await?;
+    if greeting[0] != 5 {
+        return Err(io::Error::other("unexpected SOCKS version").into());
+    }
+
+    let mut methods = vec![0u8; usize::from(greeting[1])];
+    inbound.read_exact(&mut methods).await?;
+
+    let selected_method = match auth_mode {
+        Socks5AuthMode::NoAuth => 0x00,
+        Socks5AuthMode::UsernamePassword => 0x02,
+    };
+    if !methods.contains(&selected_method) {
+        inbound.write_all(&[5, 0xff]).await?;
+        return Err(io::Error::other("client did not offer the required SOCKS auth method").into());
+    }
+    inbound.write_all(&[5, selected_method]).await?;
+
+    let (username, password) = match auth_mode {
+        Socks5AuthMode::NoAuth => (None, None),
+        Socks5AuthMode::UsernamePassword => {
+            let mut auth_version = [0u8; 1];
+            inbound.read_exact(&mut auth_version).await?;
+            if auth_version[0] != 1 {
+                return Err(io::Error::other("unexpected SOCKS auth version").into());
+            }
+
+            let username = read_socks_auth_string(&mut inbound).await?;
+            let password = read_socks_auth_string(&mut inbound).await?;
+            inbound.write_all(&[1, 0]).await?;
+            (Some(username), Some(password))
+        }
+    };
+
+    let mut request = [0u8; 4];
+    inbound.read_exact(&mut request).await?;
+    if request[0] != 5 || request[1] != 1 {
+        return Err(io::Error::other("unsupported SOCKS request").into());
+    }
+
+    let target_host = read_socks_target_host(&mut inbound, request[3]).await?;
+    let mut port = [0u8; 2];
+    inbound.read_exact(&mut port).await?;
+    let target_port = u16::from_be_bytes(port);
+
+    records.lock().await.push(SocksConnectRecord {
+        target_host: target_host.clone(),
+        target_port,
+        username,
+        password,
+    });
+
+    let mut outbound = TcpStream::connect((target_host.as_str(), target_port)).await?;
+    inbound.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    Ok(())
+}
+
+async fn read_socks_auth_string(stream: &mut TcpStream) -> Result<String, BoxSendSyncError> {
+    let mut len = [0u8; 1];
+    stream.read_exact(&mut len).await?;
+    let mut bytes = vec![0u8; usize::from(len[0])];
+    stream.read_exact(&mut bytes).await?;
+    String::from_utf8(bytes)
+        .map_err(|err| io::Error::other(format!("invalid UTF-8 in SOCKS auth field: {err}")).into())
+}
+
+async fn read_socks_target_host(
+    stream: &mut TcpStream,
+    address_type: u8,
+) -> Result<String, BoxSendSyncError> {
+    match address_type {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await?;
+            Ok(IpAddr::from(octets).to_string())
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut host = vec![0u8; usize::from(len[0])];
+            stream.read_exact(&mut host).await?;
+            String::from_utf8(host).map_err(|err| {
+                io::Error::other(format!("invalid UTF-8 in SOCKS hostname: {err}")).into()
+            })
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await?;
+            Ok(IpAddr::from(octets).to_string())
+        }
+        _ => Err(io::Error::other("unsupported SOCKS address type").into()),
+    }
 }
 
 impl TestServices {
@@ -67,6 +227,22 @@ impl TestServices {
 
         Ok(Self {
             cert: cert.cert,
+            directory_scheme: "https",
+            directory: (directory.0, Some(directory.1)),
+            ohttp_relay: (ohttp_relay.0, Some(ohttp_relay.1)),
+            http_agent,
+        })
+    }
+
+    pub async fn initialize_plain_http() -> Result<Self, BoxSendSyncError> {
+        let cert = local_cert_key();
+        let directory = init_directory_plain_http().await?;
+        let ohttp_relay = init_ohttp_relay(RootCertStore::empty(), None).await?;
+        let http_agent: Arc<Client> = Arc::new(plain_http_agent()?);
+
+        Ok(Self {
+            cert: cert.cert,
+            directory_scheme: "http",
             directory: (directory.0, Some(directory.1)),
             ohttp_relay: (ohttp_relay.0, Some(ohttp_relay.1)),
             http_agent,
@@ -75,7 +251,9 @@ impl TestServices {
 
     pub fn cert(&self) -> Vec<u8> { self.cert.der().to_vec() }
 
-    pub fn directory_url(&self) -> String { format!("https://localhost:{}", self.directory.0) }
+    pub fn directory_url(&self) -> String {
+        format!("{}://localhost:{}", self.directory_scheme, self.directory.0)
+    }
 
     pub fn take_directory_handle(&mut self) -> JoinHandle<Result<(), BoxSendSyncError>> {
         self.directory.1.take().expect("directory handle not found")
@@ -100,12 +278,16 @@ impl TestServices {
     }
 
     pub async fn fetch_ohttp_keys(&self) -> Result<OhttpKeys, IOError> {
-        fetch_ohttp_keys_with_cert(
-            self.ohttp_relay_url().as_str(),
-            self.directory_url().as_str(),
-            &self.cert(),
-        )
-        .await
+        if self.directory_scheme == "https" {
+            fetch_ohttp_keys_with_cert(
+                self.ohttp_relay_url().as_str(),
+                self.directory_url().as_str(),
+                &self.cert(),
+            )
+            .await
+        } else {
+            fetch_ohttp_keys(self.ohttp_relay_url().as_str(), self.directory_url().as_str()).await
+        }
     }
 }
 
@@ -129,6 +311,32 @@ pub async fn init_directory(
 
     let (port, handle) =
         payjoin_mailroom::serve_manual_tls(config, Some(tls_config), root_store, None)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let handle = tokio::spawn(async move {
+        let _tempdir = tempdir; // keep the tempdir until the directory shuts down
+        handle.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string().into())
+    });
+
+    Ok((port, handle))
+}
+
+pub async fn init_directory_plain_http() -> std::result::Result<
+    (u16, tokio::task::JoinHandle<std::result::Result<(), BoxSendSyncError>>),
+    BoxSendSyncError,
+> {
+    let tempdir = tempdir()?;
+    let config = payjoin_mailroom::config::Config::new(
+        "[::]:0".parse().expect("valid listener address"),
+        tempdir.path().to_path_buf(),
+        Duration::from_secs(2),
+        None,
+        Some(payjoin_mailroom::config::V1Config::default()),
+    );
+
+    let (port, handle) =
+        payjoin_mailroom::serve_manual_tls(config, None, RootCertStore::empty(), None)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -231,6 +439,10 @@ fn create_and_fund_wallets<W: AsRef<str>>(
 
 pub fn http_agent(cert_der: Vec<u8>) -> Result<Client, BoxSendSyncError> {
     Ok(http_agent_builder(cert_der).build()?)
+}
+
+pub fn plain_http_agent() -> Result<Client, BoxSendSyncError> {
+    Ok(ClientBuilder::new().http1_only().build()?)
 }
 
 pub fn init_bitcoind_multi_sender_single_reciever(
