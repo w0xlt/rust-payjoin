@@ -1548,4 +1548,97 @@ mod tests {
             certificate_key: None,
         }
     }
+
+    fn test_config_with_socks_proxy(relay: Url, directory: Url, socks_proxy: Url) -> Config {
+        let mut config = test_config(relay, directory);
+        if let Some(VersionConfig::V2(v2)) = config.version.as_mut() {
+            v2.socks_proxy = Some(socks_proxy);
+        }
+        config
+    }
+
+    /// Returns a 127.0.0.1 port that no socket is currently listening on.
+    ///
+    /// Bind to an ephemeral port, capture it, then drop the listener so the next
+    /// connection attempt is refused at TCP. Inherently racy if another process
+    /// grabs the port in between, but this is a single-host unit test so the
+    /// window is tiny.
+    async fn unbound_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral port should succeed");
+        let port = listener
+            .local_addr()
+            .expect("listener should expose its local address")
+            .port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn fetch_ohttp_keys_via_relay_tunnel_surfaces_socks_error_when_proxy_is_unreachable() {
+        let port = unbound_loopback_port().await;
+        let relay = Url::parse("http://relay.example").expect("static relay URL should parse");
+        let directory =
+            Url::parse("http://directory.example").expect("static directory URL should parse");
+        let socks_proxy = Url::parse(&format!("socks5h://127.0.0.1:{port}"))
+            .expect("synthetic SOCKS URL should parse");
+        let config = test_config_with_socks_proxy(relay.clone(), directory.clone(), socks_proxy);
+
+        let err = fetch_ohttp_keys_via_relay_tunnel(&config, &relay, &directory, None)
+            .await
+            .expect_err("bootstrap should fail when the SOCKS proxy is unreachable");
+
+        assert!(
+            crate::app::v2::is_socks_proxy_error(&err),
+            "unreachable SOCKS proxy must be classified as a SOCKS error so failover skips, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_ohttp_keys_via_relay_tunnel_surfaces_socks_error_when_proxy_rejects_auth() {
+        use payjoin_test_utils::{Socks5Behavior, TestSocks5Proxy};
+
+        let proxy = TestSocks5Proxy::start_with_behavior(Socks5Behavior::RejectAuthMethod)
+            .await
+            .expect("test SOCKS proxy should start");
+        let relay = Url::parse("http://relay.example").expect("static relay URL should parse");
+        let directory =
+            Url::parse("http://directory.example").expect("static directory URL should parse");
+        let socks_proxy = Url::parse(&proxy.url()).expect("test proxy URL should parse");
+        let config = test_config_with_socks_proxy(relay.clone(), directory.clone(), socks_proxy);
+
+        let err = fetch_ohttp_keys_via_relay_tunnel(&config, &relay, &directory, None)
+            .await
+            .expect_err("bootstrap should fail when the proxy refuses every auth method");
+
+        assert!(
+            crate::app::v2::is_socks_proxy_error(&err),
+            "auth-method rejection must be classified as a SOCKS error so failover skips, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_ohttp_keys_via_relay_tunnel_surfaces_socks_error_when_proxy_rejects_target() {
+        use payjoin_test_utils::{Socks5Behavior, TestSocks5Proxy};
+
+        // 0x02 = connection not allowed by ruleset.
+        let proxy = TestSocks5Proxy::start_with_behavior(Socks5Behavior::RejectTarget(0x02))
+            .await
+            .expect("test SOCKS proxy should start");
+        let relay = Url::parse("http://relay.example").expect("static relay URL should parse");
+        let directory =
+            Url::parse("http://directory.example").expect("static directory URL should parse");
+        let socks_proxy = Url::parse(&proxy.url()).expect("test proxy URL should parse");
+        let config = test_config_with_socks_proxy(relay.clone(), directory.clone(), socks_proxy);
+
+        let err = fetch_ohttp_keys_via_relay_tunnel(&config, &relay, &directory, None)
+            .await
+            .expect_err("bootstrap should fail when the proxy rejects the target host");
+
+        assert!(
+            crate::app::v2::is_socks_proxy_error(&err),
+            "target rejection must be classified as a SOCKS error so failover skips, got: {err:?}"
+        );
+    }
 }
