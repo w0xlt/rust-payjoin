@@ -746,25 +746,25 @@ impl App {
                 ReceiveSession::Initialized(proposal) =>
                     self.read_from_directory(proposal, persister, relay_manager).await,
                 ReceiveSession::UncheckedOriginalPayload(proposal) =>
-                    self.check_proposal(proposal, persister).await,
+                    self.check_proposal(proposal, persister, relay_manager).await,
                 ReceiveSession::MaybeInputsOwned(proposal) =>
-                    self.check_inputs_not_owned(proposal, persister).await,
+                    self.check_inputs_not_owned(proposal, persister, relay_manager).await,
                 ReceiveSession::MaybeInputsSeen(proposal) =>
-                    self.check_no_inputs_seen_before(proposal, persister).await,
+                    self.check_no_inputs_seen_before(proposal, persister, relay_manager).await,
                 ReceiveSession::OutputsUnknown(proposal) =>
-                    self.identify_receiver_outputs(proposal, persister).await,
+                    self.identify_receiver_outputs(proposal, persister, relay_manager).await,
                 ReceiveSession::WantsOutputs(proposal) =>
-                    self.commit_outputs(proposal, persister).await,
+                    self.commit_outputs(proposal, persister, relay_manager).await,
                 ReceiveSession::WantsInputs(proposal) =>
-                    self.contribute_inputs(proposal, persister).await,
+                    self.contribute_inputs(proposal, persister, relay_manager).await,
                 ReceiveSession::WantsFeeRange(proposal) =>
-                    self.apply_fee_range(proposal, persister).await,
+                    self.apply_fee_range(proposal, persister, relay_manager).await,
                 ReceiveSession::ProvisionalProposal(proposal) =>
-                    self.finalize_proposal(proposal, persister).await,
+                    self.finalize_proposal(proposal, persister, relay_manager).await,
                 ReceiveSession::PayjoinProposal(proposal) =>
-                    self.send_payjoin_proposal(proposal, persister).await,
+                    self.send_payjoin_proposal(proposal, persister, relay_manager).await,
                 ReceiveSession::HasReplyableError(error) =>
-                    self.handle_error(error, persister).await,
+                    self.handle_error(error, persister, relay_manager).await,
                 ReceiveSession::Monitor(proposal) =>
                     self.monitor_payjoin_proposal(proposal, persister).await,
                 ReceiveSession::Closed(_) => return Err(anyhow!("Session closed")),
@@ -782,19 +782,20 @@ impl App {
     ) -> Result<()> {
         let mut interrupt = self.interrupt.clone();
         let receiver = tokio::select! {
-            res = self.long_poll_fallback(session, persister, relay_manager) => res,
+            res = self.long_poll_fallback(session, persister, relay_manager.clone()) => res,
             _ = interrupt.changed() => {
                 println!("Interrupted. Call the `resume` command to resume all sessions.");
                 return Err(anyhow!("Interrupted"));
             }
         }?;
-        self.check_proposal(receiver, persister).await
+        self.check_proposal(receiver, persister, relay_manager).await
     }
 
     async fn check_proposal(
         &self,
         proposal: Receiver<UncheckedOriginalPayload>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
@@ -807,13 +808,14 @@ impl App {
 
         println!("Fallback transaction received. Consider broadcasting this to get paid if the Payjoin fails:");
         println!("{}", serialize_hex(&proposal.extract_tx_to_schedule_broadcast()));
-        self.check_inputs_not_owned(proposal, persister).await
+        self.check_inputs_not_owned(proposal, persister, relay_manager).await
     }
 
     async fn check_inputs_not_owned(
         &self,
         proposal: Receiver<MaybeInputsOwned>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
@@ -823,26 +825,28 @@ impl App {
                     .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
             })
             .save(persister)?;
-        self.check_no_inputs_seen_before(proposal, persister).await
+        self.check_no_inputs_seen_before(proposal, persister, relay_manager).await
     }
 
     async fn check_no_inputs_seen_before(
         &self,
         proposal: Receiver<MaybeInputsSeen>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let proposal = proposal
             .check_no_inputs_seen_before(&mut |input| {
                 Ok(self.db.insert_input_seen_before(*input)?)
             })
             .save(persister)?;
-        self.identify_receiver_outputs(proposal, persister).await
+        self.identify_receiver_outputs(proposal, persister, relay_manager).await
     }
 
     async fn identify_receiver_outputs(
         &self,
         proposal: Receiver<OutputsUnknown>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
@@ -852,22 +856,24 @@ impl App {
                     .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
             })
             .save(persister)?;
-        self.commit_outputs(proposal, persister).await
+        self.commit_outputs(proposal, persister, relay_manager).await
     }
 
     async fn commit_outputs(
         &self,
         proposal: Receiver<WantsOutputs>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let proposal = proposal.commit_outputs().save(persister)?;
-        self.contribute_inputs(proposal, persister).await
+        self.contribute_inputs(proposal, persister, relay_manager).await
     }
 
     async fn contribute_inputs(
         &self,
         proposal: Receiver<WantsInputs>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let candidate_inputs = wallet.list_unspent()?;
@@ -881,22 +887,24 @@ impl App {
         let selected_input = proposal.try_preserving_privacy(candidate_inputs)?;
         let proposal =
             proposal.contribute_inputs(vec![selected_input])?.commit_inputs().save(persister)?;
-        self.apply_fee_range(proposal, persister).await
+        self.apply_fee_range(proposal, persister, relay_manager).await
     }
 
     async fn apply_fee_range(
         &self,
         proposal: Receiver<WantsFeeRange>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let proposal = proposal.apply_fee_range(None, self.config.max_fee_rate).save(persister)?;
-        self.finalize_proposal(proposal, persister).await
+        self.finalize_proposal(proposal, persister, relay_manager).await
     }
 
     async fn finalize_proposal(
         &self,
         proposal: Receiver<ProvisionalProposal>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
@@ -906,15 +914,15 @@ impl App {
                     .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
             })
             .save(persister)?;
-        self.send_payjoin_proposal(proposal, persister).await
+        self.send_payjoin_proposal(proposal, persister, relay_manager).await
     }
 
     async fn send_payjoin_proposal(
         &self,
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
-        let relay_manager = Self::new_relay_manager();
         let session_socks_auth = self.receiver_socks_auth(persister)?;
         let (res, ohttp_ctx) = post_v2_request_with_relay_failover(
             &self.config,
@@ -992,8 +1000,8 @@ impl App {
         &self,
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
+        relay_manager: Arc<Mutex<RelayManager>>,
     ) -> Result<()> {
-        let relay_manager = Self::new_relay_manager();
         let session_socks_auth = self.receiver_socks_auth(persister)?;
         let (err_response, err_ctx) = post_v2_request_with_relay_failover(
             &self.config,
