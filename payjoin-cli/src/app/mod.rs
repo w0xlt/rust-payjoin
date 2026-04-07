@@ -77,7 +77,6 @@ fn http_agent(_config: &Config) -> Result<reqwest::Client> {
 }
 
 #[cfg(feature = "v2")]
-#[allow(dead_code)]
 pub(crate) fn v2_http_agent(
     config: &Config,
     session_socks_auth: Option<&SocksAuth>,
@@ -103,7 +102,6 @@ fn http_agent_builder(
 }
 
 #[cfg(feature = "v2")]
-#[allow(dead_code)]
 fn http_agent_with_socks(_config: &Config, socks_proxy: &Url) -> Result<reqwest::Client> {
     let proxy = reqwest::Proxy::all(socks_proxy.as_str())?;
     #[cfg(feature = "_manual-tls")]
