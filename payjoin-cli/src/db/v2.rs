@@ -229,12 +229,19 @@ impl SessionPersister for ReceiverPersister {
     }
 }
 
+const KNOWN_SESSION_TABLES: &[&str] = &["send_sessions", "receive_sessions"];
+
+fn assert_known_session_table(table: &str) {
+    assert!(KNOWN_SESSION_TABLES.contains(&table), "unexpected session table name: {table}");
+}
+
 impl Database {
     fn get_session_socks_auth(
         &self,
         table: &str,
         session_id: &SessionId,
     ) -> Result<Option<SocksAuth>> {
+        assert_known_session_table(table);
         let conn = self.get_connection()?;
         Self::get_session_socks_auth_from_conn(&conn, table, session_id)
     }
@@ -262,6 +269,7 @@ impl Database {
         table: &str,
         session_id: &SessionId,
     ) -> Result<SocksAuth> {
+        assert_known_session_table(table);
         if let Some(existing_auth) = self.get_session_socks_auth(table, session_id)? {
             return Ok(existing_auth);
         }
