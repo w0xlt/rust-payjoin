@@ -596,13 +596,14 @@ mod tests {
             tempdir.path().to_path_buf(),
             Duration::from_secs(2),
             None,
+            None,
         );
 
         let sentinel_tag = generate_sentinel_tag();
         let metrics = MetricsService::new(Some(provider.clone()));
         let services = Services {
             directory: init_directory(&config, sentinel_tag, &metrics).await.unwrap(),
-            relay: crate::ohttp_relay::Service::new(sentinel_tag).await,
+            relay: crate::ohttp_relay::Service::new(sentinel_tag, None).await.unwrap(),
             metrics,
             #[cfg(feature = "access-control")]
             geoip: None,
