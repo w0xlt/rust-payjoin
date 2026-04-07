@@ -200,34 +200,39 @@ fn default_bootstrap_root_store() -> Result<tokio_rustls::rustls::RootCertStore>
     Ok(root_store)
 }
 
+/// Fetch OHTTP keys by issuing a raw HTTP/1.1 request over an already-established
+/// stream (WebSocket tunnel or TLS-over-tunnel).
+///
+/// No timeout is applied here — callers are expected to enforce their own deadline
+/// (e.g., `fetch_ohttp_keys_via_relay_tunnel_with_timeout` wraps the entire
+/// connection + handshake + fetch sequence in a single timeout).
 async fn fetch_ohttp_keys_from_http_stream(
     directory: &Url,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
 ) -> Result<OhttpKeys> {
-    fetch_ohttp_keys_from_http_stream_with_timeout(directory, stream, OHTTP_KEYS_FETCH_TIMEOUT)
-        .await
+    let host_header = host_header(directory)?;
+    let request = format!(
+        "GET /.well-known/ohttp-gateway HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/ohttp-keys\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let response = read_bootstrap_http_response(stream).await?;
+    let _ = stream.shutdown().await;
+    parse_ohttp_keys_http_response(&response)
 }
 
+/// Test-friendly variant that applies its own timeout, for unit tests that call
+/// the HTTP stream layer directly without the outer relay tunnel timeout.
+#[cfg(test)]
 async fn fetch_ohttp_keys_from_http_stream_with_timeout(
     directory: &Url,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     timeout: Duration,
 ) -> Result<OhttpKeys> {
-    // Mirror the 10-second request timeout used by payjoin::io::fetch_ohttp_keys.
-    tokio::time::timeout(timeout, async {
-        let host_header = host_header(directory)?;
-        let request = format!(
-            "GET /.well-known/ohttp-gateway HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/ohttp-keys\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(request.as_bytes()).await?;
-        stream.flush().await?;
-
-        let response = read_bootstrap_http_response(stream).await?;
-        let _ = stream.shutdown().await;
-        parse_ohttp_keys_http_response(&response)
-    })
-    .await
-    .map_err(|_| anyhow!("timed out fetching OHTTP keys over relay tunnel"))?
+    tokio::time::timeout(timeout, fetch_ohttp_keys_from_http_stream(directory, stream))
+        .await
+        .map_err(|_| anyhow!("timed out fetching OHTTP keys over relay tunnel"))?
 }
 
 async fn read_bootstrap_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
