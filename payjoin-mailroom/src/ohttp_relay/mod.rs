@@ -220,7 +220,7 @@ fn parse_gateway_uri_from_path(path: &str, default: &GatewayUri) -> Result<Gatew
 
     let path = &path[1..];
 
-    if "http://" == &path[..7] || "https://" == &path[..8] {
+    if path.starts_with("http://") || path.starts_with("https://") {
         GatewayUri::from_str(path)
     } else {
         Ok(Authority::from_str(path)?.into())
@@ -315,4 +315,31 @@ pub(crate) fn empty() -> BoxBody<Bytes, hyper::Error> {
 
 pub(crate) fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into()).map_err(|never| match never {}).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn parse_gateway_uri_from_path_handles_short_paths_without_panicking() {
+        let default = GatewayUri::from_str(DEFAULT_GATEWAY).expect("default gateway is valid");
+
+        // Empty path and bare "/" must short-circuit to the default.
+        for path in ["", "/"] {
+            let gateway = parse_gateway_uri_from_path(path, &default)
+                .unwrap_or_else(|err| panic!("path {path:?} should resolve to default: {err}"));
+            assert_eq!(gateway, default, "path {path:?} should fall back to the default gateway");
+        }
+
+        // Paths that are too short to contain the "http://" / "https://" prefix
+        // previously panicked when the old code sliced `path[..7]`. They must
+        // now bubble up through `Authority::from_str` as a normal Result —
+        // success or error, never a panic.
+        for path in ["/x", "/h", "/htt", "/https", "/?", "/#", "/%"] {
+            let _ = parse_gateway_uri_from_path(path, &default);
+        }
+    }
 }
