@@ -415,20 +415,20 @@ impl AppTrait for App {
 
         // Process sender sessions
         for session_id in send_session_ids {
-            let sender_persiter = SenderPersister::from_id(self.db.clone(), session_id.clone());
-            match replay_sender_event_log(&sender_persiter) {
+            let sender_persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
+            match replay_sender_event_log(&sender_persister) {
                 Ok((sender_state, _)) => {
                     let self_clone = self.clone();
                     let relay_manager = Self::new_relay_manager();
                     tasks.push(tokio::spawn(async move {
                         self_clone
-                            .process_sender_session(sender_state, &sender_persiter, relay_manager)
+                            .process_sender_session(sender_state, &sender_persister, relay_manager)
                             .await
                     }));
                 }
                 Err(e) => {
                     tracing::error!("An error {:?} occurred while replaying Sender session", e);
-                    Self::close_failed_session(&sender_persiter, &session_id, "sender");
+                    Self::close_failed_session(&sender_persister, &session_id, "sender");
                 }
             }
         }
