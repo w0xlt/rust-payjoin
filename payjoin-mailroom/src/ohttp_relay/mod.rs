@@ -220,7 +220,7 @@ fn parse_gateway_uri_from_path(path: &str, default: &GatewayUri) -> Result<Gatew
 
     let path = &path[1..];
 
-    if "http://" == &path[..7] || "https://" == &path[..8] {
+    if path.starts_with("http://") || path.starts_with("https://") {
         GatewayUri::from_str(path)
     } else {
         Ok(Authority::from_str(path)?.into())
