@@ -440,6 +440,8 @@ fn read_crlf_line<'a>(body: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 fn find_crlf(body: &[u8]) -> Option<usize> { body.windows(2).position(|window| window == b"\r\n") }
 
+// NOTE: this type mirrors payjoin-mailroom/src/ohttp_relay/bootstrap/ws.rs `WsIo`.
+// If you change the implementation here, update the other copy too.
 struct WsIo<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,

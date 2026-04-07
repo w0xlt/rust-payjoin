@@ -110,6 +110,8 @@ where
     Ok(())
 }
 
+// NOTE: this type mirrors payjoin-cli/src/app/v2/bootstrap.rs `WsIo`.
+// If you change the implementation here, update the other copy too.
 pub struct WsIo<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
