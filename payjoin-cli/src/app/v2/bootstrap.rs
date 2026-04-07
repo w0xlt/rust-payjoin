@@ -71,6 +71,11 @@ async fn fetch_ohttp_keys_via_relay_tunnel_with_timeout(
     .map_err(|_| anyhow!("timed out fetching OHTTP keys over relay tunnel"))?
 }
 
+/// Build a WebSocket URL that encodes the directory origin in the path.
+///
+/// The resulting URL looks like `ws://relay.example/http://directory.example/`.
+/// The relay's `parse_gateway_uri_from_path` strips the leading `/` and parses
+/// the remainder as a full URL to recover the gateway origin.
 fn relay_websocket_url(relay: &Url, directory: &Url) -> Result<Url> {
     let mut ws_url = relay.clone();
     match ws_url.scheme() {
