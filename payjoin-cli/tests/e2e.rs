@@ -1,8 +1,14 @@
 #[cfg(feature = "_manual-tls")]
 mod e2e {
     #[cfg(feature = "v2")]
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    #[cfg(feature = "v2")]
+    use std::future::Future;
+    #[cfg(feature = "v2")]
+    use std::io::ErrorKind;
     use std::process::{ExitStatus, Stdio};
+    #[cfg(feature = "v2")]
+    use std::time::Instant;
 
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -27,6 +33,8 @@ mod e2e {
     const RECEIVE_SATS: &str = "54321";
     #[cfg(feature = "v2")]
     const V2_E2E_STEP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+    #[cfg(feature = "v2")]
+    const V2_E2E_LOCK_ADDR: &str = "127.0.0.1:42473";
 
     #[cfg(feature = "v2")]
     #[derive(Clone, Debug)]
@@ -77,6 +85,76 @@ mod e2e {
     }
 
     #[cfg(feature = "v2")]
+    async fn run_v2_stage<T, F>(stage: &'static str, future: F) -> Result<T, BoxError>
+    where
+        F: Future<Output = Result<T, BoxError>>,
+    {
+        let start = Instant::now();
+        tracing::info!(stage, "v2 e2e stage started");
+
+        match future.await {
+            Ok(value) => {
+                tracing::info!(
+                    stage,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "v2 e2e stage completed"
+                );
+                Ok(value)
+            }
+            Err(err) => {
+                tracing::error!(
+                    stage,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    error = %err,
+                    "v2 e2e stage failed"
+                );
+                Err(format!(
+                    "stage `{stage}` failed after {} ms: {err}",
+                    start.elapsed().as_millis()
+                )
+                .into())
+            }
+        }
+    }
+
+    #[cfg(feature = "v2")]
+    async fn acquire_v2_e2e_process_lock(
+    ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+        let start = Instant::now();
+        let mut wait_logged = false;
+
+        loop {
+            match tokio::net::TcpListener::bind(V2_E2E_LOCK_ADDR).await {
+                Ok(listener) => {
+                    tracing::info!(
+                        elapsed_ms = start.elapsed().as_millis(),
+                        lock_addr = V2_E2E_LOCK_ADDR,
+                        "acquired v2 e2e cross-process lock"
+                    );
+                    return Ok(listener);
+                }
+                Err(err) if err.kind() == ErrorKind::AddrInUse => {
+                    if !wait_logged {
+                        tracing::info!(
+                            lock_addr = V2_E2E_LOCK_ADDR,
+                            "waiting for v2 e2e cross-process lock"
+                        );
+                        wait_logged = true;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed to acquire v2 e2e cross-process lock on {}: {}",
+                        V2_E2E_LOCK_ADDR, err
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "v2")]
     /// Read lines from `child_stdout` until `match_pattern` is found and the corresponding
     /// line is returned.
     /// Also writes every read line to tokio::io::stdout();
@@ -106,6 +184,90 @@ mod e2e {
         }
 
         res
+    }
+
+    #[cfg(feature = "v2")]
+    async fn wait_for_stdout_match_with_timeout<F>(
+        stage: &'static str,
+        child_stdout: &mut tokio::process::ChildStdout,
+        expected_output: &'static str,
+        match_pattern: F,
+    ) -> Result<String, BoxError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + V2_E2E_STEP_TIMEOUT;
+        let reader = BufReader::new(child_stdout);
+        let mut lines = reader.lines();
+        let mut recent_lines = VecDeque::with_capacity(8);
+        let mut stdout = tokio::io::stdout();
+
+        let recent_output = |lines: &VecDeque<String>| -> String {
+            if lines.is_empty() {
+                "<no output captured>".to_string()
+            } else {
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| format!("[{idx}] {line}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
+        };
+
+        let matched_line = loop {
+            match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                Err(_) => {
+                    return Err(format!(
+                        "stage `{stage}` timed out after {} s waiting for `{expected_output}`; recent output: {}",
+                        V2_E2E_STEP_TIMEOUT.as_secs(),
+                        recent_output(&recent_lines),
+                    )
+                    .into());
+                }
+                Ok(Ok(Some(line))) => {
+                    if recent_lines.len() == recent_lines.capacity() {
+                        let _ = recent_lines.pop_front();
+                    }
+                    recent_lines.push_back(line.clone());
+
+                    stdout
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .expect("Failed to write to stdout");
+
+                    if match_pattern(&line) {
+                        break line;
+                    }
+                }
+                Ok(Ok(None)) => {
+                    return Err(format!(
+                        "stage `{stage}` reached EOF after {} ms waiting for `{expected_output}`; recent output: {}",
+                        start.elapsed().as_millis(),
+                        recent_output(&recent_lines),
+                    )
+                    .into());
+                }
+                Ok(Err(err)) => {
+                    return Err(format!(
+                        "stage `{stage}` failed reading stdout after {} ms while waiting for `{expected_output}`: {}; recent output: {}",
+                        start.elapsed().as_millis(),
+                        err,
+                        recent_output(&recent_lines),
+                    )
+                    .into());
+                }
+            }
+        };
+
+        tracing::info!(
+            stage,
+            elapsed_ms = start.elapsed().as_millis(),
+            matched_line = %matched_line,
+            "v2 e2e stage observed expected output"
+        );
+        Ok(matched_line)
     }
 
     #[cfg(feature = "v2")]
@@ -161,7 +323,10 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        let bip21 = get_bip21_from_receiver(cli_receive_initiator).await;
+        let bip21 = run_v2_stage("receiver_emits_bip21", async move {
+            Ok(get_bip21_from_receiver(cli_receive_initiator).await)
+        })
+        .await?;
 
         let mut cli_send_initiator = Command::new(payjoin_cli);
         cli_send_initiator
@@ -185,7 +350,14 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        send_until_request_timeout(cli_send_initiator).await?;
+        run_v2_stage(
+            "sender_initial_waits_for_receiver_poll",
+            send_until_request_timeout(
+                "sender_initial_waits_for_receiver_poll",
+                cli_send_initiator,
+            ),
+        )
+        .await?;
 
         let mut cli_receive_resumer = Command::new(payjoin_cli);
         cli_receive_resumer
@@ -206,7 +378,11 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        respond_with_payjoin(cli_receive_resumer).await?;
+        run_v2_stage(
+            "receiver_resume_posts_payjoin_proposal",
+            respond_with_payjoin("receiver_resume_posts_payjoin_proposal", cli_receive_resumer),
+        )
+        .await?;
 
         let mut cli_send_resumer = Command::new(payjoin_cli);
         cli_send_resumer
@@ -230,7 +406,11 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        check_payjoin_sent(cli_send_resumer).await?;
+        run_v2_stage(
+            "sender_resume_broadcasts_payjoin",
+            check_payjoin_sent("sender_resume_broadcasts_payjoin", cli_send_resumer),
+        )
+        .await?;
 
         let funding_address = bitcoind
             .client
@@ -238,7 +418,11 @@ mod e2e {
             .address()
             .expect("address should be valid")
             .assume_checked();
-        bitcoind.client.generate_to_address(1, &funding_address)?;
+        run_v2_stage("bitcoind_confirms_payjoin", async {
+            bitcoind.client.generate_to_address(1, &funding_address)?;
+            Ok(())
+        })
+        .await?;
 
         let mut cli_receive_resumer = Command::new(payjoin_cli);
         cli_receive_resumer
@@ -260,7 +444,14 @@ mod e2e {
             .spawn()
             .expect("Failed to execute payjoin-cli");
 
-        check_resume_completed(cli_receive_resumer).await?;
+        run_v2_stage(
+            "receiver_resume_observes_confirmed_payjoin",
+            check_resume_completed(
+                "receiver_resume_observes_confirmed_payjoin",
+                cli_receive_resumer,
+            ),
+        )
+        .await?;
 
         let mut cli_receive_resumer = Command::new(payjoin_cli);
         cli_receive_resumer
@@ -281,7 +472,14 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        check_resume_has_no_sessions(cli_receive_resumer).await?;
+        run_v2_stage(
+            "receiver_resume_reports_no_sessions",
+            check_resume_has_no_sessions(
+                "receiver_resume_reports_no_sessions",
+                cli_receive_resumer,
+            ),
+        )
+        .await?;
 
         let mut cli_send_resumer = Command::new(payjoin_cli);
         cli_send_resumer
@@ -302,96 +500,87 @@ mod e2e {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("Failed to execute payjoin-cli");
-        check_resume_has_no_sessions(cli_send_resumer).await?;
+        run_v2_stage(
+            "sender_resume_reports_no_sessions",
+            check_resume_has_no_sessions("sender_resume_reports_no_sessions", cli_send_resumer),
+        )
+        .await?;
 
         Ok(())
     }
 
     #[cfg(feature = "v2")]
     async fn send_until_request_timeout(
+        stage: &'static str,
         mut cli_sender: tokio::process::Child,
     ) -> Result<(), BoxError> {
         let mut stdout = cli_sender.stdout.take().expect("failed to take stdout of child process");
-        let res = tokio::time::timeout(
-            V2_E2E_STEP_TIMEOUT,
-            wait_for_stdout_match(&mut stdout, |line| line.contains("No response yet.")),
-        )
+        wait_for_stdout_match_with_timeout(stage, &mut stdout, "No response yet.", |line| {
+            line.contains("No response yet.")
+        })
         .await?;
-
         terminate(cli_sender).await.expect("Failed to kill payjoin-cli initial sender");
-        assert!(res.is_some(), "Fallback send was not detected");
         Ok(())
     }
 
     #[cfg(feature = "v2")]
     async fn respond_with_payjoin(
+        stage: &'static str,
         mut cli_receive_resumer: tokio::process::Child,
     ) -> Result<(), BoxError> {
         let mut stdout =
             cli_receive_resumer.stdout.take().expect("Failed to take stdout of child process");
-        let res = tokio::time::timeout(
-            V2_E2E_STEP_TIMEOUT,
-            wait_for_stdout_match(&mut stdout, |line| {
-                line.contains("Response successful")
-                    || line.contains("Payjoin transaction detected in the mempool!")
-                    || line.contains("All resumed sessions completed.")
-            }),
-        )
+        wait_for_stdout_match_with_timeout(stage, &mut stdout, "Response successful", |line| {
+            line.contains("Response successful")
+        })
         .await?;
-
         terminate(cli_receive_resumer).await.expect("Failed to kill payjoin-cli");
-        assert!(res.is_some(), "Receiver resume did not advance to a successful proposal state");
         Ok(())
     }
 
     #[cfg(feature = "v2")]
     async fn check_payjoin_sent(
+        stage: &'static str,
         mut cli_send_resumer: tokio::process::Child,
     ) -> Result<(), BoxError> {
         let mut stdout =
             cli_send_resumer.stdout.take().expect("Failed to take stdout of child process");
-        let res = tokio::time::timeout(
-            V2_E2E_STEP_TIMEOUT,
-            wait_for_stdout_match(&mut stdout, |line| line.contains("Payjoin sent")),
-        )
+        wait_for_stdout_match_with_timeout(stage, &mut stdout, "Payjoin sent", |line| {
+            line.contains("Payjoin sent")
+        })
         .await?;
-
         terminate(cli_send_resumer).await.expect("Failed to kill payjoin-cli");
-        assert!(res.is_some(), "Payjoin send was not detected");
         Ok(())
     }
 
     #[cfg(feature = "v2")]
     async fn check_resume_has_no_sessions(
+        stage: &'static str,
         mut cli_resumer: tokio::process::Child,
     ) -> Result<(), BoxError> {
         let mut stdout = cli_resumer.stdout.take().expect("Failed to take stdout of child process");
-        let res = tokio::time::timeout(
-            V2_E2E_STEP_TIMEOUT,
-            wait_for_stdout_match(&mut stdout, |line| line.contains("No sessions to resume.")),
-        )
+        wait_for_stdout_match_with_timeout(stage, &mut stdout, "No sessions to resume.", |line| {
+            line.contains("No sessions to resume.")
+        })
         .await?;
-
         terminate(cli_resumer).await.expect("Failed to kill payjoin-cli");
-        assert!(res.is_some(), "Expected no sessions to resume");
         Ok(())
     }
 
     #[cfg(feature = "v2")]
     async fn check_resume_completed(
+        stage: &'static str,
         mut cli_resumer: tokio::process::Child,
     ) -> Result<(), BoxError> {
         let mut stdout = cli_resumer.stdout.take().expect("Failed to take stdout of child process");
-        let res = tokio::time::timeout(
-            V2_E2E_STEP_TIMEOUT,
-            wait_for_stdout_match(&mut stdout, |line| {
-                line.contains("All resumed sessions completed.")
-            }),
+        wait_for_stdout_match_with_timeout(
+            stage,
+            &mut stdout,
+            "All resumed sessions completed.",
+            |line| line.contains("All resumed sessions completed."),
         )
         .await?;
-
         terminate(cli_resumer).await.expect("Failed to kill payjoin-cli");
-        assert!(res.is_some(), "Expected all resumed sessions completed");
         Ok(())
     }
 
@@ -594,6 +783,7 @@ mod e2e {
         use payjoin_test_utils::init_tracing;
 
         init_tracing();
+        let _serial_guard = acquire_v2_e2e_process_lock().await?;
         let mut services = TestServices::initialize().await?;
         let temp_dir = tempdir()?;
         let network = V2NetworkConfig::direct();
@@ -615,6 +805,7 @@ mod e2e {
         use payjoin_test_utils::init_tracing;
 
         init_tracing();
+        let _serial_guard = acquire_v2_e2e_process_lock().await?;
         let mut services = TestServices::initialize().await?;
         let temp_dir = tempdir()?;
         let mut socks_proxy = TestSocks5Proxy::start(Socks5AuthMode::NoAuth).await?;
@@ -648,6 +839,7 @@ mod e2e {
         use payjoin_test_utils::init_tracing;
 
         init_tracing();
+        let _serial_guard = acquire_v2_e2e_process_lock().await?;
         let mut services = TestServices::initialize().await?;
         let temp_dir = tempdir()?;
         let mut socks_proxy = TestSocks5Proxy::start(Socks5AuthMode::UsernamePassword).await?;
@@ -684,6 +876,7 @@ mod e2e {
         type Result<T> = std::result::Result<T, BoxError>;
 
         init_tracing();
+        let _serial_guard = acquire_v2_e2e_process_lock().await?;
         let services = TestServices::initialize().await?;
         let temp_dir = tempdir()?;
 
