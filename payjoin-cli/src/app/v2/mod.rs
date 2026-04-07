@@ -1037,9 +1037,9 @@ mod tests {
     use payjoin::persist::NoopSessionPersister;
     use payjoin::receive::v2::ReceiverBuilder;
     use tempfile::tempdir;
-    use tokio::task;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::task;
     use url::Url;
 
     use super::*;

@@ -61,10 +61,7 @@ where
 
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await.expect("Failed to read line from stdout") {
-        stdout
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .expect("Failed to write to stdout");
+        stdout.write_all(format!("{line}\n").as_bytes()).await.expect("Failed to write to stdout");
 
         if match_pattern(&line) {
             res = Some(line);
@@ -77,11 +74,10 @@ where
 
 pub async fn get_bip21_from_receiver(mut cli_receiver: tokio::process::Child) -> String {
     let mut stdout = cli_receiver.stdout.take().expect("failed to take stdout of child process");
-    let bip21 = wait_for_stdout_match(&mut stdout, |line| {
-        line.to_ascii_uppercase().starts_with("BITCOIN")
-    })
-    .await
-    .expect("payjoin-cli receiver should output a bitcoin URI");
+    let bip21 =
+        wait_for_stdout_match(&mut stdout, |line| line.to_ascii_uppercase().starts_with("BITCOIN"))
+            .await
+            .expect("payjoin-cli receiver should output a bitcoin URI");
     tracing::debug!("Got bip21 {}", &bip21);
 
     terminate(cli_receiver).await.expect("Failed to kill payjoin-cli");
@@ -123,10 +119,8 @@ pub async fn assert_socks_proxy_usage(
             .collect::<HashSet<_>>();
         let username_counts =
             auth_records.iter().fold(HashMap::<String, usize>::new(), |mut counts, record| {
-                let username = record
-                    .username
-                    .clone()
-                    .expect("authenticated records should have usernames");
+                let username =
+                    record.username.clone().expect("authenticated records should have usernames");
                 *counts.entry(username).or_default() += 1;
                 counts
             });

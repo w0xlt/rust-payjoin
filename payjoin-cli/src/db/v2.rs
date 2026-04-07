@@ -211,10 +211,7 @@ impl SessionPersister for ReceiverPersister {
 const KNOWN_SESSION_TABLES: &[&str] = &["send_sessions", "receive_sessions"];
 
 fn assert_known_session_table(table: &str) {
-    assert!(
-        KNOWN_SESSION_TABLES.contains(&table),
-        "unexpected session table name: {table}"
-    );
+    assert!(KNOWN_SESSION_TABLES.contains(&table), "unexpected session table name: {table}");
 }
 
 impl Database {
